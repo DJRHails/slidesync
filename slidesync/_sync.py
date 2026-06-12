@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import datetime
 import difflib
 import hashlib
@@ -1147,6 +1148,16 @@ def push(slides_api, drive, deck, source, anchor, prune, base_dir=Path("."),
     creates, deletes, skips, pruned = plan_sync(source, managed, prune, force)
     if not (creates or deletes or pruned):  # nothing changed — skip reorder/links/gets
         return {"create": 0, "skip": len(skips), "replace": 0, "prune": 0}
+    if not force:
+        # Non-fast-forward guard: replacing or pruning a slide that was edited
+        # in Google Slides since its last push would silently discard that edit.
+        risks = _clobber_risks(pres, managed, source, pruned)
+        if risks:
+            for key in risks:
+                logger.error(f"live edit would be lost: {key}")
+            sys.exit("push rejected: the deck changed in Google Slides since the "
+                     "last push (slides above). Run `slidesync sync` to reconcile, "
+                     "or `push --force` to overwrite.")
     layouts = _layout_map(slides_api, deck, pres)
     templates = _template_index(slides_api, deck, pres)
     reqs = [{"deleteObject": {"objectId": oid}} for oid in deletes + pruned]
@@ -2004,20 +2015,130 @@ def _diff(a: list[str], b: list[str], a_name: str, b_name: str) -> str:
     return "\n".join(difflib.unified_diff(a, b, a_name, b_name, lineterm=""))
 
 
-def cmd_sync(args):
-    """Report per-slide drift between a markdown deck and its live Slides copy.
+def _live_state(s) -> tuple[list[str], str, str | None, dict]:
+    """(text lines, normalised notes, base source, marker) of a live slide."""
+    notes_raw = _read_notes(s)
+    marker = _read_marker(notes_raw)
+    base_src = base64.b64decode(marker["src"]).decode() if "src" in marker else None
+    notes = " ".join(MARKER_RE.sub("", notes_raw).split())
+    return text_lines_native(s), notes, base_src, marker
 
-    Detection, not resolution: each slide is classified against the marker's
-    last-pushed source (the merge base). Additive changes (comments, notes-pane
-    edits) are printed as ready-to-paste `<!-- @Author: ... -->` blocks; text
-    conflicts are printed as unified diffs for a human/LLM to fold into the
-    markdown, after which a normal `push` (or `push --force` to clobber
-    live-only drift) makes the file authoritative again. Exits 1 if anything
-    drifted.
+
+def _clobber_risks(pres, managed, source, pruned) -> list[str]:
+    """Keys of slides whose live edits a push would silently discard.
+
+    A replace (or prune) deletes the live slide, which loses information only
+    when the live copy drifted from its merge base AND the local markdown does
+    not already contain the live content (as it does right after `sync`).
+    Legacy slides without a src marker can't be checked and are allowed.
+    """
+    live = {s["objectId"]: s for s in pres.get("slides", [])}
+    by_kh = {s.key_hash: s for s in source}
+    out = []
+    for kh, (oid, _ch) in managed.items():
+        sl = by_kh.get(kh)
+        replacing = sl is not None and sl.custom is None and sl.object_id != oid
+        if not (replacing or oid in pruned) or live.get(oid) is None:
+            continue
+        live_lines, live_notes, base_src, _marker_ = _live_state(live[oid])
+        if base_src is None:
+            continue
+        if (live_lines == text_lines_md(base_src)
+                and live_notes == " ".join(_extract_notes(base_src).split())):
+            continue  # deck untouched since last push
+        if (sl is not None and live_lines == text_lines_md(sl.src or "")
+                and live_notes == " ".join((sl.notes or "").split())):
+            continue  # local already carries the live edit
+        out.append(sl.key if sl is not None else oid)
+    return out
+
+
+def _slide_from_live_boxes(s, marker: dict) -> Slide:
+    """Rebuild a template slide's content from its deterministically-named boxes
+    (`_k` kicker, `_h` headline, `_by` byline, `_b` body), formatting runs
+    included — so live text edits can be written back into the markdown."""
+    sid = s["objectId"]
+    shapes = {el.get("objectId", ""): el["shape"]
+              for el in s.get("pageElements", [])
+              if el.get("shape", {}).get("text")}
+
+    def paras(suffix: str) -> list[Para]:
+        shape = shapes.get(sid + suffix)
+        return _paras_from_shape(shape) if shape else []
+
+    slide = Slide(marker.get("id", sid), "content")
+    slide.template_name = marker.get("template")
+    slide.vars = marker.get("vars", {})
+    if (slide.template_name or "").lower() in ("prompt", "code"):
+        slide.title = _flatten(paras("_k")).strip()
+        slide.verbatim = "\n".join(p.text for p in paras("_b"))
+        return slide
+    headline = _flatten(paras("_h")).strip()
+    kicker = _flatten(paras("_k")).strip()
+    if headline:
+        slide.title, slide.kicker = headline, kicker
+    else:
+        slide.title = kicker  # content template: the kicker IS the title
+    slide.paras = paras("_b") or paras("_by")
+    if marker.get("img"):
+        slide.layout = "image"
+        slide.image, slide.image_alt = marker["img"], marker.get("alt", "")
+    return slide
+
+
+def _render_body(slide: Slide) -> str:
+    """Slide -> markdown body only (the slide's frontmatter stays as authored)."""
+    bare = copy.copy(slide)
+    bare.template_name, bare.layout_name, bare.vars = None, None, {}
+    return to_slidev(bare, include_id=False).strip()
+
+
+_SEP_RE = re.compile(r"(?m)^---[ \t]*$")
+
+
+def _slide_span(text: str, key: str) -> tuple[int, int] | None:
+    """(start, end) of the body of the slide whose frontmatter id is `key`."""
+    m = re.search(rf"(?m)^id:\s*{re.escape(key)}\s*$", text)
+    if not m:
+        return None  # slide has no id: frontmatter — can't anchor file surgery
+    closer = _SEP_RE.search(text, m.end())
+    if not closer:
+        return None
+    nxt = _SEP_RE.search(text, closer.end())
+    return closer.end(), nxt.start() if nxt else len(text)
+
+
+def _replace_slide_body(text: str, key: str, body: str) -> str:
+    span = _slide_span(text, key)
+    if span is None:
+        return text
+    return text[:span[0]] + "\n" + body.strip("\n") + "\n\n" + text[span[1]:]
+
+
+def _append_to_slide_body(text: str, key: str, block: str) -> str:
+    span = _slide_span(text, key)
+    if span is None:
+        return text
+    return text[:span[1]].rstrip("\n") + "\n" + block + "\n\n" + text[span[1]:]
+
+
+def cmd_sync(args):
+    """Reconcile a markdown deck with its live Slides copy — applying what's safe.
+
+    Pull side: unresolved comment threads are appended to their slide as
+    `<!-- @Author: text -->` blocks (orphaned threads are re-anchored via the
+    objectId's key-hash), and live-drift slides — edited in Slides, untouched
+    locally — are written back into the markdown, reconstructed from their
+    styled boxes. Conflict slides (both sides changed) are never touched: their
+    diffs print for a human/LLM to resolve, and the push step is skipped.
+    Push side: when no conflicts remain, the (updated) file is pushed — safe,
+    because local now matches live wherever the deck had drifted. Exits 1 when
+    conflicts remain.
     """
     slides_api, drive = get_services(args.account)
-    source = load_slides(args.source)
-    deck = args.deck or deck_from_source(args.source)
+    path = args.source
+    source = load_slides(path)
+    deck = args.deck or deck_from_source(path)
     if not deck:
         sys.exit("no target deck: pass --deck or add `deck:` frontmatter")
     pres = slides_api.presentations().get(presentationId=deck).execute()
@@ -2027,59 +2148,82 @@ def cmd_sync(args):
     for c in shape_comments(list_comments(drive, deck)):
         if not c["resolved"] and c["page"]:
             by_page.setdefault(c["page"], []).append(c)
-    drifted = 0
+
+    state = {"text": path.read_text(), "dirty": False, "pushable": False}
+    key_by_kh = {sl.key_hash: sl.key for sl in source}
+
+    def capture(key: str | None, c: dict, page: str) -> None:
+        lines = [f"@{c['author']}: {c['content']}"]
+        lines += [f"@{r['author']}: {r['content']}" for r in c["replies"]]
+        block = "<!-- " + "\n".join(lines) + " -->"
+        if " ".join(c["content"].split()) in " ".join(state["text"].split()):
+            return  # already captured
+        new = _append_to_slide_body(state["text"], key, block) if key else state["text"]
+        if new != state["text"]:
+            state.update(text=new, dirty=True, pushable=True)
+            logger.info(f"[comment   ] {key} — captured thread by {c['author']}")
+        else:
+            logger.warning(f"[comment   ] thread by {c['author']} on {key or page} "
+                           f"couldn't be placed; paste manually:\n{block}")
+
+    conflicts = []
     for sl in source:
         s = live.pop(sl.key_hash, None)
         if s is None:
-            logger.warning(f"[missing   ] {sl.key} — not in deck; push will create it")
-            drifted += 1
+            logger.info(f"[missing   ] {sl.key} — push will create it")
+            state["pushable"] = True
             continue
         for c in by_page.pop(s["objectId"], []):
-            drifted += 1
-            lines = [f"@{c['author']}: {c['content']}"]
-            lines += [f"@{r['author']}: {r['content']}" for r in c["replies"]]
-            logger.info(f"[comment   ] {sl.key} ({c['modified']}):\n"
-                        + "<!-- " + "\n".join(lines) + " -->")
+            capture(sl.key, c, s["objectId"])
         if sl.custom is not None:
-            continue  # pull-authoritative; drawings are captured, not diffed
-        notes_raw = _read_notes(s)
-        marker = _read_marker(notes_raw)
-        base_src = (base64.b64decode(marker["src"]).decode()
-                    if "src" in marker else None)
+            continue  # pull-authoritative; drawings are captured by pull, not diffed
+        live_lines, live_notes, base_src, marker = _live_state(s)
         base = text_lines_md(base_src) if base_src is not None else None
-        local = text_lines_md(sl.src or "")
-        live_lines = text_lines_native(s)
-        status = classify_drift(base, local, live_lines)
-        pushed_at = marker.get("at", "?")
+        status = classify_drift(base, text_lines_md(sl.src or ""), live_lines)
         if status in ("clean", "converged"):
             continue
-        drifted += 1
         if status == "local-edit":
             logger.info(f"[local-edit] {sl.key} — push will update it")
-        elif status in ("live-drift", "drift-no-base"):
-            logger.warning(f"[live-drift] {sl.key} (pushed {pushed_at}) — edited in "
-                           f"Slides; fold into the markdown or `push --force` to clobber:\n"
-                           + _diff(base if base is not None else local, live_lines,
-                                   "last-pushed" if base is not None else "local", "live"))
-        else:  # conflict
-            logger.error(f"[conflict  ] {sl.key} (pushed {pushed_at}) — both sides "
-                         f"changed since last push:\n"
-                         + _diff(base, local, "last-pushed", "local") + "\n"
-                         + _diff(base, live_lines, "last-pushed", "live"))
-        live_notes = " ".join(MARKER_RE.sub("", notes_raw).split())
-        base_notes = " ".join(_extract_notes(base_src).split()) if base_src else ""
-        if base_src is not None and live_notes != base_notes:
-            logger.info(f"[notes     ] {sl.key} — notes pane edited live:\n{live_notes}")
-    for kh, s in live.items():
-        logger.warning(f"[unmanaged ] {s['objectId']} in deck has no local slide "
-                       "(--prune on push would delete it)")
-    for page, cs in by_page.items():
+            state["pushable"] = True
+            continue
+        rebuilt = (_slide_from_live_boxes(s, marker)
+                   if status in ("live-drift", "drift-no-base")
+                   and marker.get("template") else None)
+        if rebuilt and (rebuilt.title or rebuilt.paras or rebuilt.verbatim):
+            rebuilt.notes = " ".join(MARKER_RE.sub("", _read_notes(s)).split())
+            new = _replace_slide_body(state["text"], sl.key, _render_body(rebuilt))
+            if new != state["text"]:
+                state.update(text=new, dirty=True, pushable=True)
+                logger.info(f"[pulled    ] {sl.key} — live edit written back")
+                continue
+        conflicts.append(sl.key)
+        logger.error(f"[conflict  ] {sl.key} (pushed {marker.get('at', '?')}) — "
+                     f"resolve in the markdown, then push:\n"
+                     + _diff(base or [], text_lines_md(sl.src or ""),
+                             "last-pushed", "local") + "\n"
+                     + _diff(base or [], live_lines, "last-pushed", "live"))
+    for page, cs in by_page.items():  # threads on re-rendered (deleted) pages
+        m = re.match(r"s2g_(?P<kh>[0-9a-f]{10})_", page)
+        key = key_by_kh.get(m.group("kh")) if m else None
         for c in cs:
-            logger.warning(f"[orphaned  ] comment by {c['author']} anchored to deleted "
-                           f"slide {page}: {c['content']!r}")
-    logger.log("WARNING" if drifted else "SUCCESS",
-               f"{drifted} drifted item(s)" if drifted else "deck matches source")
-    sys.exit(1 if drifted else 0)
+            capture(key, c, page)
+    for _kh, s in live.items():
+        logger.warning(f"[unmanaged ] {s['objectId']} has no local slide "
+                       "(push --prune would delete it)")
+
+    if state["dirty"]:
+        path.write_text(state["text"])
+        logger.success(f"updated {path}")
+    if conflicts:
+        sys.exit(f"sync stopped: {len(conflicts)} conflict(s) above — resolve in "
+                 "the markdown, then `slidesync push` (its guard protects the rest).")
+    if state["pushable"]:
+        stats = push(slides_api, drive, deck, load_slides(path), anchor=None,
+                     prune=False, base_dir=path.parent)
+        logger.success(f"{stats} -> "
+                       f"https://docs.google.com/presentation/d/{deck}/edit")
+    else:
+        logger.success("deck matches source — nothing to do")
 
 
 def _loop_hop(slides_api, drive, title, slides):
