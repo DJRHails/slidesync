@@ -195,6 +195,8 @@ class Slide:
     custom: str | None = None  # ```gslides``` literal Slides API requests (JSON)
     verbatim: str | None = None  # ``` ``` fenced body for prompt/code slides
     src: str | None = None  # body markdown as authored (comments in place)
+    src_path: Path | None = None  # source file this slide was loaded from
+    src_key: str = ""  # id as written in that file (un-namespaced)
     key_hash: str = ""
     content_hash: str = ""
     object_id: str = ""
@@ -252,6 +254,55 @@ INLINE_RE = re.compile(
 
 def load_slides(path: Path) -> list[Slide]:
     return build_slides(split_slides(path.read_text()))
+
+
+LOCAL_LINK_RE = re.compile(
+    r"""(?x)
+    \]\(\#              # close of [text], open of (#...
+    (?P<target>[\w-]+)  # the slide id being linked to
+    \)                  # close paren
+    """
+)
+
+
+def load_deck(paths: list[Path]) -> list[Slide]:
+    """Load one or many source files into a single slide list.
+
+    With several files (e.g. `slidesync sync meetings/*.slidev.md`, one file per
+    meeting), deck order follows the argument order and every slide id is
+    namespaced with its file's stem (`2026-06-15-overview`) so files can reuse
+    ids without colliding. Intra-file `[text](#id)` links are rewritten to the
+    namespaced target; already-qualified cross-file links pass through. Each
+    slide remembers its origin (`src_path`/`src_key`) so `sync` writes captures
+    and live edits back into the right file. Duplicate keys are an error.
+    """
+    if len(paths) == 1:
+        slides = load_slides(paths[0])
+        for s in slides:
+            s.src_path, s.src_key = paths[0], s.key
+    else:
+        slides = []
+        for path in paths:
+            prefix = path.name.split(".")[0]
+            chunks = split_slides(path.read_text())
+            local = {m.get("id") or f"slide{i}" for i, (m, _b) in enumerate(chunks)}
+
+            def relink(m, prefix=prefix, local=local):
+                t = m.group("target")
+                return f"](#{prefix}-{t})" if t in local else m.group(0)
+
+            for i, (meta, body) in enumerate(chunks):
+                src_key = meta.get("id") or f"slide{i}"
+                meta = {**meta, "id": f"{prefix}-{src_key}"}
+                slide = build_slide(meta, LOCAL_LINK_RE.sub(relink, body), i)
+                slide.src_path, slide.src_key = path, src_key
+                slides.append(slide)
+    seen, dupes = set(), set()
+    for s in slides:
+        (dupes if s.key in seen else seen).add(s.key)
+    if dupes:
+        sys.exit(f"duplicate slide ids across sources: {sorted(dupes)}")
+    return slides
 
 
 def split_slides(text: str) -> list[tuple[dict, str]]:
@@ -1227,7 +1278,9 @@ def _resolve_image(drive, slide: Slide, base_dir=Path(".")):
         return None, None
     p = Path(slide.image)
     if not p.is_absolute():
-        p = base_dir / p
+        # Relative to the slide's own source file (multi-file decks), else the
+        # caller's base directory.
+        p = (slide.src_path.parent if slide.src_path else base_dir) / p
     if not p.exists():
         logger.warning(f"image not found, graphic skipped: {p}")
         return None, None
@@ -1865,18 +1918,33 @@ def deck_from_source(path: Path) -> str | None:
     return m.group("id") if m else str(val)
 
 
+def _source_paths(args) -> list[Path]:
+    paths = args.source if isinstance(args.source, list) else [args.source]
+    return [Path(p) for p in paths]
+
+
+def _deck_of(args, paths: list[Path]) -> str | None:
+    if args.deck:
+        return args.deck
+    for p in paths:
+        if d := deck_from_source(p):
+            return d
+    return None
+
+
 def cmd_push(args):
-    source = load_slides(args.source)
-    logger.info(f"parsed {len(source)} slides from {args.source}")
+    paths = _source_paths(args)
+    source = load_deck(paths)
+    logger.info(f"parsed {len(source)} slides from {len(paths)} file(s)")
     slides_api, drive = get_services(args.account)
-    deck = args.deck or deck_from_source(args.source)
+    deck = _deck_of(args, paths)
     if args.new:
         deck = new_deck(slides_api, args.new)
         logger.info(f"created https://docs.google.com/presentation/d/{deck}/edit")
     if not deck:
         sys.exit("no target deck: pass --deck/--new or add `deck:` frontmatter")
     stats = push(slides_api, drive, deck, source, args.anchor, args.prune,
-                 base_dir=args.source.parent, force=args.force)
+                 base_dir=paths[0].parent, force=args.force)
     logger.success(f"{stats} -> https://docs.google.com/presentation/d/{deck}/edit")
 
 
@@ -2151,9 +2219,9 @@ def cmd_sync(args):
     conflicts remain.
     """
     slides_api, drive = get_services(args.account)
-    path = args.source
-    source = load_slides(path)
-    deck = args.deck or deck_from_source(path)
+    paths = _source_paths(args)
+    source = load_deck(paths)
+    deck = _deck_of(args, paths)
     if not deck:
         sys.exit("no target deck: pass --deck or add `deck:` frontmatter")
     pres = slides_api.presentations().get(presentationId=deck).execute()
@@ -2164,34 +2232,52 @@ def cmd_sync(args):
         if not c["resolved"] and c["page"]:
             by_page.setdefault(c["page"], []).append(c)
 
-    state = {"text": path.read_text(), "dirty": False, "pushable": False}
-    key_by_kh = {sl.key_hash: sl.key for sl in source}
+    texts = {p: p.read_text() for p in paths}
+    state = {"dirty": set(), "pushable": False}
+    origin_by_kh = {sl.key_hash: (sl.src_path, sl.src_key) for sl in source}
 
-    def capture(key: str | None, c: dict, page: str) -> None:
+    def capture(origin: tuple[Path, str] | None, c: dict, page: str) -> None:
         lines = [f"@{c['author']}: {c['content']}"]
         lines += [f"@{r['author']}: {r['content']}" for r in c["replies"]]
         block = "<!-- " + "\n".join(lines) + " -->"
-        if " ".join(c["content"].split()) in " ".join(state["text"].split()):
+        path, key = origin if origin else (None, None)
+        if path and " ".join(c["content"].split()) in " ".join(texts[path].split()):
             return  # already captured
-        new = _append_to_slide_body(state["text"], key, block) if key else state["text"]
-        if new != state["text"]:
-            state.update(text=new, dirty=True, pushable=True)
-            logger.info(f"[comment   ] {key} — captured thread by {c['author']}")
+        new = _append_to_slide_body(texts[path], key, block) if path else None
+        if new is not None and new != texts[path]:
+            texts[path] = new
+            state["dirty"].add(path)
+            state["pushable"] = True
+            logger.info(f"[comment   ] {key} — captured thread by {c['author']} "
+                        f"-> {path.name}")
         else:
             logger.warning(f"[comment   ] thread by {c['author']} on {key or page} "
                            f"couldn't be placed; paste manually:\n{block}")
 
     conflicts = []
     for sl in source:
+        origin = (sl.src_path, sl.src_key)
         s = live.pop(sl.key_hash, None)
         if s is None:
             logger.info(f"[missing   ] {sl.key} — push will create it")
             state["pushable"] = True
             continue
         for c in by_page.pop(s["objectId"], []):
-            capture(sl.key, c, s["objectId"])
+            capture(origin, c, s["objectId"])
         if sl.custom is not None:
-            continue  # pull-authoritative; drawings are captured by pull, not diffed
+            # Pull-authoritative: refresh the ```gslides``` block from the live
+            # drawing so hand-drawn edits land back in the source file.
+            marker = _read_marker(_read_notes(s))
+            live_json = (_custom_slide_from_native(s, marker, "").custom
+                         if "id" in marker else None)
+            if live_json and live_json.strip() != (sl.custom or "").strip():
+                new = texts[sl.src_path].replace(sl.custom, live_json, 1)
+                if new != texts[sl.src_path]:
+                    texts[sl.src_path] = new
+                    state["dirty"].add(sl.src_path)
+                    logger.info(f"[drawing   ] {sl.key} — captured live drawing "
+                                f"-> {sl.src_path.name}")
+            continue
         live_lines, live_notes, base_src, marker = _live_state(s)
         base = _content_lines(base_src, marker.get("template"))
         local = _content_lines(sl.src or "", sl.template_name) or []
@@ -2207,10 +2293,14 @@ def cmd_sync(args):
                    and marker.get("template") else None)
         if rebuilt and (rebuilt.title or rebuilt.paras or rebuilt.verbatim):
             rebuilt.notes = " ".join(MARKER_RE.sub("", _read_notes(s)).split())
-            new = _replace_slide_body(state["text"], sl.key, _render_body(rebuilt))
-            if new != state["text"]:
-                state.update(text=new, dirty=True, pushable=True)
-                logger.info(f"[pulled    ] {sl.key} — live edit written back")
+            new = _replace_slide_body(texts[sl.src_path], sl.src_key,
+                                      _render_body(rebuilt))
+            if new != texts[sl.src_path]:
+                texts[sl.src_path] = new
+                state["dirty"].add(sl.src_path)
+                state["pushable"] = True
+                logger.info(f"[pulled    ] {sl.key} — live edit written back "
+                            f"-> {sl.src_path.name}")
                 continue
         conflicts.append(sl.key)
         logger.error(f"[conflict  ] {sl.key} (pushed {marker.get('at', '?')}) — "
@@ -2220,22 +2310,22 @@ def cmd_sync(args):
                      + _diff(base or [], live_lines, "last-pushed", "live"))
     for page, cs in by_page.items():  # threads on re-rendered (deleted) pages
         m = re.match(r"s2g_(?P<kh>[0-9a-f]{10})_", page)
-        key = key_by_kh.get(m.group("kh")) if m else None
+        origin = origin_by_kh.get(m.group("kh")) if m else None
         for c in cs:
-            capture(key, c, page)
+            capture(origin, c, page)
     for _kh, s in live.items():
         logger.warning(f"[unmanaged ] {s['objectId']} has no local slide "
                        "(push --prune would delete it)")
 
-    if state["dirty"]:
-        path.write_text(state["text"])
-        logger.success(f"updated {path}")
+    for p in sorted(state["dirty"]):
+        p.write_text(texts[p])
+        logger.success(f"updated {p}")
     if conflicts:
         sys.exit(f"sync stopped: {len(conflicts)} conflict(s) above — resolve in "
                  "the markdown, then `slidesync push` (its guard protects the rest).")
     if state["pushable"]:
-        stats = push(slides_api, drive, deck, load_slides(path), anchor=None,
-                     prune=False, base_dir=path.parent)
+        stats = push(slides_api, drive, deck, load_deck(paths), anchor=None,
+                     prune=args.prune, base_dir=paths[0].parent)
         logger.success(f"{stats} -> "
                        f"https://docs.google.com/presentation/d/{deck}/edit")
     else:
@@ -2295,7 +2385,9 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("push")
-    p.add_argument("source", type=Path)
+    p.add_argument("source", type=Path, nargs="+",
+                   help="one or more .slidev.md files; several files merge into "
+                        "one deck with ids namespaced by file stem")
     p.add_argument("--deck")
     p.add_argument("--new")
     p.add_argument("--anchor")
@@ -2324,9 +2416,12 @@ def main():
     p.set_defaults(func=cmd_comments)
 
     p = sub.add_parser("sync",
-                       help="report drift vs the live deck (comments, live edits, conflicts)")
-    p.add_argument("source", type=Path)
+                       help="reconcile with the live deck (comments, live edits, conflicts)")
+    p.add_argument("source", type=Path, nargs="+",
+                   help="one or more .slidev.md files (ids namespaced by stem when several)")
     p.add_argument("--deck")
+    p.add_argument("--prune", action="store_true",
+                   help="the final push deletes managed slides missing from the sources")
     p.set_defaults(func=cmd_sync)
 
     p = sub.add_parser("make-templates",

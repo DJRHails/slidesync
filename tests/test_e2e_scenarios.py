@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from slidesync import _sync
-from slidesync._sync import cmd_sync, load_slides, push
+from slidesync._sync import cmd_sync, load_deck, load_slides, push
 
 DECK = "fakedeck"
 
@@ -190,7 +190,7 @@ def env(tmp_path, monkeypatch):
 
 
 def _sync_cmd(env):
-    cmd_sync(SimpleNamespace(source=env.path, deck=DECK, account=None))
+    cmd_sync(SimpleNamespace(source=env.path, deck=DECK, account=None, prune=False))
 
 
 def _push(env, force=False, prune=False):
@@ -316,5 +316,106 @@ def test_graph_slides_with_unrenderable_text_stay_clean(tmp_path, monkeypatch):
     push(slides_api, drive, DECK, load_slides(path), anchor=None, prune=False,
          base_dir=tmp_path)
     before = path.read_text()
-    cmd_sync(SimpleNamespace(source=path, deck=DECK, account=None))
+    cmd_sync(SimpleNamespace(source=path, deck=DECK, account=None, prune=False))
     assert path.read_text() == before  # no write-back, no conflict, no churn
+
+
+WEEK_A = """---
+theme: seriph
+---
+
+---
+template: topic
+id: thread-x
+---
+# Newer week takeaway
+## FINDING
+
+Newer point one.
+
+[appendix link](#thread-y)
+[cross week](#2026-06-01-thread-x)
+
+---
+---
+template: topic
+id: thread-y
+---
+# Newer week appendix
+## BACKUP
+
+Appendix detail.
+"""
+
+WEEK_B = """---
+theme: seriph
+---
+
+---
+template: topic
+id: thread-x
+---
+# Older week takeaway
+## FINDING
+
+Older point one.
+"""
+
+
+@pytest.fixture
+def multi(tmp_path, monkeypatch):
+    store, drive = FakeStore(), FakeDrive()
+    slides_api = FakeSlides(store)
+    monkeypatch.setattr(_sync, "get_services", lambda account: (slides_api, drive))
+    a = tmp_path / "2026-06-08.slidev.md"
+    b = tmp_path / "2026-06-01.slidev.md"
+    a.write_text(WEEK_A)
+    b.write_text(WEEK_B)
+    push(slides_api, drive, DECK, load_deck([a, b]), anchor=None, prune=False,
+         base_dir=tmp_path)
+    return SimpleNamespace(store=store, drive=drive, slides=slides_api, a=a, b=b)
+
+
+def _multi_sync(env):
+    cmd_sync(SimpleNamespace(source=[env.a, env.b], deck=DECK, account=None,
+                             prune=False))
+
+
+def test_multi_file_namespaces_ids_and_intra_file_links(multi):
+    slides = load_deck([multi.a, multi.b])
+    assert [s.key for s in slides] == ["2026-06-08-thread-x", "2026-06-08-thread-y",
+                                       "2026-06-01-thread-x"]
+    newer = slides[0]
+    links = [r.link for p in newer.paras for r in p.runs if r.style == "link"]
+    assert "#2026-06-08-thread-y" in links     # intra-file: namespaced
+    assert "#2026-06-01-thread-x" in links     # cross-file: already qualified
+    assert (newer.src_path, newer.src_key) == (multi.a, "thread-x")
+
+
+def test_multi_file_comment_capture_routes_to_origin_file(multi):
+    multi.drive.add(multi.store.oid_of("Older point one"), "comment on the old week")
+    _multi_sync(multi)
+    assert "<!-- @Daniel Hails: comment on the old week -->" in multi.b.read_text()
+    assert "comment on the old week" not in multi.a.read_text()
+
+
+def test_multi_file_live_drift_writes_back_to_origin_file(multi):
+    multi.store.edit_text("Older point one", "Older point one, live-edited")
+    _multi_sync(multi)
+    assert "live-edited" in multi.b.read_text()
+    assert "live-edited" not in multi.a.read_text()
+    # the source file keeps its LOCAL id, not the namespaced one
+    assert "id: thread-x" in multi.b.read_text()
+    assert "id: 2026-06-01-thread-x" not in multi.b.read_text()
+
+
+def test_duplicate_keys_across_files_are_rejected(tmp_path):
+    a = tmp_path / "same.slidev.md"
+    b = tmp_path / "same2.slidev.md"
+    a.write_text(WEEK_B)
+    b.write_text(WEEK_B.replace("same", "same"))
+    # same stem prefix collision: copy a file so namespaced keys collide
+    c = tmp_path / "same.copy.slidev.md"  # stem "same" again (split on first dot)
+    c.write_text(WEEK_B)
+    with pytest.raises(SystemExit):
+        load_deck([a, c])
