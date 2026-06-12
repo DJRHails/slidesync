@@ -159,22 +159,64 @@ class FakeSlides:
         return _Req(lambda: self.store.apply(body["requests"]))
 
 
+class _FakeComments:
+    def __init__(self, drive):
+        self.d = drive
+
+    def list(self, fileId, pageSize=None, pageToken=None, fields=None):
+        return _Req(lambda: {"comments": self.d.threads})
+
+    def create(self, fileId, body=None, fields=None):
+        def go():
+            self.d.add_raw(body.get("anchor"), body["content"])
+            return {"id": self.d.threads[-1]["id"]}
+        return _Req(go)
+
+    def delete(self, fileId, commentId):
+        def go():
+            self.d.threads = [t for t in self.d.threads if t["id"] != commentId]
+            return {}
+        return _Req(go)
+
+
+class _FakeReplies:
+    def __init__(self, drive):
+        self.d = drive
+
+    def create(self, fileId, commentId, body=None, fields=None):
+        def go():
+            t = next(t for t in self.d.threads if t["id"] == commentId)
+            t["replies"].append({"author": {"displayName": "Daniel Hails"},
+                                 "content": body["content"]})
+            return {"id": f"r{len(t['replies'])}"}
+        return _Req(go)
+
+
 class FakeDrive:
     def __init__(self):
         self.threads = []  # raw Drive comment dicts
+        self.n = 0
 
     def comments(self):
-        return self
+        return _FakeComments(self)
 
-    def list(self, fileId, pageSize=None, pageToken=None, fields=None):
-        return _Req(lambda: {"comments": self.threads})
+    def replies(self):
+        return _FakeReplies(self)
 
-    def add(self, page_oid, content, author="Daniel Hails"):
+    def add_raw(self, anchor, content, author="Daniel Hails"):
+        self.n += 1
         self.threads.append({
-            "id": f"c{len(self.threads)}",
-            "anchor": json.dumps({"type": "page", "pages": [page_oid]}),
+            "id": f"c{self.n}", "anchor": anchor,
             "author": {"displayName": author},
             "content": content, "replies": []})
+
+    def add(self, page_oid, content, author="Daniel Hails"):
+        self.add_raw(json.dumps({"type": "page", "pages": [page_oid]}),
+                     content, author)
+
+    def thread_pages(self):
+        return {t["id"]: json.loads(t["anchor"])["pages"][0]
+                for t in self.threads}
 
 
 @pytest.fixture
@@ -419,3 +461,34 @@ def test_duplicate_keys_across_files_are_rejected(tmp_path):
     c.write_text(WEEK_B)
     with pytest.raises(SystemExit):
         load_deck([a, c])
+
+
+def test_captured_thread_stays_a_comment_not_speaker_notes(env):
+    env.drive.add(env.store.oid_of("Takeaway A"), "still a real comment?")
+    _sync_cmd(env)  # capture -> re-render -> re-anchor
+    # 1. mirrored into the markdown
+    assert "<!-- @Daniel Hails: still a real comment? -->" in env.path.read_text()
+    # 2. NOT in the slide's speaker notes
+    slide = next(s for s in env.store.slides
+                 if any("Takeaway A" in sh["text"] for sh in s["shapes"].values()))
+    assert "still a real comment" not in slide["notes"]
+    # 3. still a live thread, re-anchored to the slide's NEW objectId
+    [thread] = env.drive.threads
+    page = json.loads(thread["anchor"])["pages"][0]
+    assert page == slide["id"], "thread must follow the re-rendered slide"
+    # 4. stable: a second sync changes nothing
+    before_threads = env.drive.threads.copy()
+    before = env.path.read_text()
+    _sync_cmd(env)
+    assert env.path.read_text() == before and env.drive.threads == before_threads
+
+
+def test_resolved_threads_are_not_revived(env):
+    env.drive.add(env.store.oid_of("Takeaway A"), "old decision, settled")
+    _sync_cmd(env)  # captured + re-anchored
+    for t in env.drive.threads:
+        t["resolved"] = True
+    _local_edit(env)  # force a re-render of the commented slide's file
+    _sync_cmd(env)
+    assert all(t.get("resolved") for t in env.drive.threads), \
+        "push must not re-create resolved threads"
