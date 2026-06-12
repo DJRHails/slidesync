@@ -100,11 +100,15 @@ file-level `modifiedTime`; the marker's `at` stamp records our last push):
 | `conflict` | both changed since last push | prints both diffs vs the base for a human/LLM to resolve; skips the push; exits 1 |
 
 Unresolved comment threads are appended to their slide as
-`<!-- @Author: text -->` blocks (replies as extra `@Author:` lines), and threads
-orphaned by a re-render are re-anchored to their slide via the objectId's
-key-hash. Captured text round-trips from then on. Write-back caveat: a slide
-edited live is rewritten canonically, so its authored comments collapse into
-one trailing block (untouched slides keep comments in place).
+`<!-- @Author: text -->` blocks (replies as extra `@Author:` lines). These
+mirrors are **comments, not presenter notes**: they stay out of the
+speaker-notes pane, and when a re-render orphans the live thread, push
+re-creates it anchored to the slide's new objectId (replies preserved; the
+re-created thread is authored by the authenticated account). Resolving a
+thread in Slides retires it — sync stops capturing and push won't revive it.
+Write-back caveat: a slide edited live is rewritten canonically, so its
+authored comments collapse into one trailing block (untouched slides keep
+comments in place).
 
 ## Markdown dialect
 
