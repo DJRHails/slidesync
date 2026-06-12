@@ -36,6 +36,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import datetime
+import difflib
 import hashlib
 import html
 import json
@@ -580,6 +582,10 @@ def _marker(slide: Slide) -> str:
             data["src"] = base64.b64encode(slide.src.encode()).decode()
     elif slide.layout_name and slide.layout_name not in SECTION_LAYOUTS:
         data["tpl"] = slide.layout_name
+    # Last-push stamp: `sync` reports it alongside drift. The Slides/Drive APIs
+    # have no per-slide edit times (file-level modifiedTime only), so this is
+    # the only per-slide timestamp that exists.
+    data["at"] = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     return f"<!-- s2g {json.dumps(data, separators=(',', ':'))} -->"
 
 
@@ -1890,6 +1896,192 @@ def cmd_layouts(args):
         logger.info(f"{name:<24} {', '.join(phs) or '(no placeholders)'}")
 
 
+# ---------------------------------------------------------------------------
+# Comments + sync (drift detection)
+# ---------------------------------------------------------------------------
+
+
+def shape_comments(raw: list[dict]) -> list[dict]:
+    """Drive comment threads -> [{id, page, author, content, resolved, replies}].
+
+    `page` is the anchored slide objectId (None for file-level comments) —
+    note an objectId outlives its slide, so the anchor may point at a deleted
+    page after a re-render. Resolve-action replies with no text are dropped.
+    """
+    out = []
+    for c in raw:
+        try:
+            anchor = json.loads(c.get("anchor") or "{}")
+        except json.JSONDecodeError:
+            anchor = {}
+        pages = anchor.get("pages") or []
+        out.append({
+            "id": c.get("id", ""),
+            "page": pages[0] if pages else None,
+            "author": (c.get("author") or {}).get("displayName", ""),
+            "content": (c.get("content") or "").strip(),
+            "resolved": bool(c.get("resolved")),
+            "modified": c.get("modifiedTime", ""),
+            "replies": [
+                {"author": (r.get("author") or {}).get("displayName", ""),
+                 "content": (r.get("content") or "").strip()}
+                for r in c.get("replies", []) if (r.get("content") or "").strip()
+            ],
+        })
+    return out
+
+
+_COMMENT_FIELDS = ("nextPageToken,comments(id,content,author(displayName),"
+                   "anchor,resolved,modifiedTime,replies(content,author(displayName)))")
+
+
+def list_comments(drive, deck: str) -> list[dict]:
+    raw, token = [], None
+    while True:
+        resp = drive.comments().list(fileId=deck, pageSize=100, pageToken=token,
+                                     fields=_COMMENT_FIELDS).execute()
+        raw += resp.get("comments", [])
+        token = resp.get("nextPageToken")
+        if not token:
+            return raw
+
+
+def cmd_comments(args):
+    _, drive = get_services(args.account)
+    print(json.dumps(shape_comments(list_comments(drive, args.deck)), indent=2))
+
+
+def text_lines_md(src: str) -> list[str]:
+    """Markdown slide body -> normalised visible text lines (comments excluded)."""
+    fences = [m.group("text") for m in VERBATIM_RE.finditer(src)]
+    headings, paras, _img, _alt, table, _ = parse_body(VERBATIM_RE.sub("", src))
+    lines = [headings[k] for k in sorted(headings)]
+    lines += [p.text for p in paras]
+    if table:
+        lines += [" | ".join(row) for row in table]
+    for f in fences:
+        lines += f.splitlines()
+    return _norm_lines(lines)
+
+
+def text_lines_native(s: dict) -> list[str]:
+    """Native slide JSON -> normalised visible text lines (notes excluded)."""
+    boxes = []
+    for el in s.get("pageElements", []):
+        if el.get("shape", {}).get("text"):
+            paras = _paras_from_shape(el["shape"])
+            if paras:
+                boxes.append((_el_y(el), _el_x(el), paras))
+        elif el.get("table"):
+            rows = _table_from_native(el["table"])
+            boxes.append((_el_y(el), _el_x(el),
+                          [Para(" | ".join(r)) for r in rows]))
+    boxes.sort(key=lambda t: (t[0], t[1]))
+    return _norm_lines([p.text for _, _, paras in boxes for p in paras])
+
+
+def _norm_lines(lines: list[str]) -> list[str]:
+    # Sorted: box reading-order vs markdown order differ legitimately (e.g. a
+    # kicker renders above the headline but is written below it).
+    return sorted(" ".join(line.split()) for line in lines if line.strip())
+
+
+def classify_drift(base: list[str] | None, local: list[str],
+                   live: list[str]) -> str:
+    """Three-way status for one slide; base is the last-pushed source (marker)."""
+    if base is None:
+        return "clean" if local == live else "drift-no-base"
+    if local == base and live == base:
+        return "clean"
+    if local != base and live == base:
+        return "local-edit"
+    if local == base and live != base:
+        return "live-drift"
+    return "converged" if local == live else "conflict"
+
+
+def _diff(a: list[str], b: list[str], a_name: str, b_name: str) -> str:
+    return "\n".join(difflib.unified_diff(a, b, a_name, b_name, lineterm=""))
+
+
+def cmd_sync(args):
+    """Report per-slide drift between a markdown deck and its live Slides copy.
+
+    Detection, not resolution: each slide is classified against the marker's
+    last-pushed source (the merge base). Additive changes (comments, notes-pane
+    edits) are printed as ready-to-paste `<!-- @Author: ... -->` blocks; text
+    conflicts are printed as unified diffs for a human/LLM to fold into the
+    markdown, after which a normal `push` (or `push --force` to clobber
+    live-only drift) makes the file authoritative again. Exits 1 if anything
+    drifted.
+    """
+    slides_api, drive = get_services(args.account)
+    source = load_slides(args.source)
+    deck = args.deck or deck_from_source(args.source)
+    if not deck:
+        sys.exit("no target deck: pass --deck or add `deck:` frontmatter")
+    pres = slides_api.presentations().get(presentationId=deck).execute()
+    live = {s["objectId"].split("_")[1]: s for s in pres.get("slides", [])
+            if MANAGED_RE.match(s["objectId"])}
+    by_page = {}
+    for c in shape_comments(list_comments(drive, deck)):
+        if not c["resolved"] and c["page"]:
+            by_page.setdefault(c["page"], []).append(c)
+    drifted = 0
+    for sl in source:
+        s = live.pop(sl.key_hash, None)
+        if s is None:
+            logger.warning(f"[missing   ] {sl.key} — not in deck; push will create it")
+            drifted += 1
+            continue
+        for c in by_page.pop(s["objectId"], []):
+            drifted += 1
+            lines = [f"@{c['author']}: {c['content']}"]
+            lines += [f"@{r['author']}: {r['content']}" for r in c["replies"]]
+            logger.info(f"[comment   ] {sl.key} ({c['modified']}):\n"
+                        + "<!-- " + "\n".join(lines) + " -->")
+        if sl.custom is not None:
+            continue  # pull-authoritative; drawings are captured, not diffed
+        notes_raw = _read_notes(s)
+        marker = _read_marker(notes_raw)
+        base_src = (base64.b64decode(marker["src"]).decode()
+                    if "src" in marker else None)
+        base = text_lines_md(base_src) if base_src is not None else None
+        local = text_lines_md(sl.src or "")
+        live_lines = text_lines_native(s)
+        status = classify_drift(base, local, live_lines)
+        pushed_at = marker.get("at", "?")
+        if status in ("clean", "converged"):
+            continue
+        drifted += 1
+        if status == "local-edit":
+            logger.info(f"[local-edit] {sl.key} — push will update it")
+        elif status in ("live-drift", "drift-no-base"):
+            logger.warning(f"[live-drift] {sl.key} (pushed {pushed_at}) — edited in "
+                           f"Slides; fold into the markdown or `push --force` to clobber:\n"
+                           + _diff(base if base is not None else local, live_lines,
+                                   "last-pushed" if base is not None else "local", "live"))
+        else:  # conflict
+            logger.error(f"[conflict  ] {sl.key} (pushed {pushed_at}) — both sides "
+                         f"changed since last push:\n"
+                         + _diff(base, local, "last-pushed", "local") + "\n"
+                         + _diff(base, live_lines, "last-pushed", "live"))
+        live_notes = " ".join(MARKER_RE.sub("", notes_raw).split())
+        base_notes = " ".join(_extract_notes(base_src).split()) if base_src else ""
+        if base_src is not None and live_notes != base_notes:
+            logger.info(f"[notes     ] {sl.key} — notes pane edited live:\n{live_notes}")
+    for kh, s in live.items():
+        logger.warning(f"[unmanaged ] {s['objectId']} in deck has no local slide "
+                       "(--prune on push would delete it)")
+    for page, cs in by_page.items():
+        for c in cs:
+            logger.warning(f"[orphaned  ] comment by {c['author']} anchored to deleted "
+                           f"slide {page}: {c['content']!r}")
+    logger.log("WARNING" if drifted else "SUCCESS",
+               f"{drifted} drifted item(s)" if drifted else "deck matches source")
+    sys.exit(1 if drifted else 0)
+
+
 def _loop_hop(slides_api, drive, title, slides):
     """One md->slides hop: build a deck, push, pull back."""
     deck = new_deck(slides_api, title)
@@ -1965,6 +2157,17 @@ def main():
     p = sub.add_parser("layouts", help="list a deck's master layouts + placeholders")
     p.add_argument("deck")
     p.set_defaults(func=cmd_layouts)
+
+    p = sub.add_parser("comments",
+                       help="list comment threads as JSON (page anchor, author, replies)")
+    p.add_argument("deck")
+    p.set_defaults(func=cmd_comments)
+
+    p = sub.add_parser("sync",
+                       help="report drift vs the live deck (comments, live edits, conflicts)")
+    p.add_argument("source", type=Path)
+    p.add_argument("--deck")
+    p.set_defaults(func=cmd_sync)
 
     p = sub.add_parser("make-templates",
                        help="add branded tagged template slides to a deck")
