@@ -45,6 +45,8 @@ Support path.)
 | `slidesync roundtrip [--keep]` | self-test: push a sample, pull, assert identical |
 | `slidesync layouts <deckId>` | list a deck's theme layouts + placeholders |
 | `slidesync make-templates <deckId>` | inject branded `{{token}}` template slides |
+| `slidesync comments <deckId>` | list comment threads as JSON (page anchor, author, content, replies) |
+| `slidesync sync <file.slidev.md> [--deck ID]` | report drift vs the live deck — comments, live edits, conflicts (exit 1 on drift) |
 
 `push` resolves the target deck from (in order) `--deck`, `--new`, or a top-level
 `deck:` frontmatter key. Relative image paths resolve against the markdown file's
@@ -68,6 +70,25 @@ slides are ever touched** — hand-authored slides are invisible to the sync. A
 hidden `<!-- s2g {...} -->` marker in speaker notes carries the human id, image
 path, template vars — and, for template slides, the authored body markdown
 (base64) — so `pull` recovers the source verbatim.
+
+## Sync & drift (detection, not resolution)
+
+The marker's last-pushed source is a true per-slide **merge base**, so `sync`
+classifies each slide three-way without timestamps (the Slides API has no
+per-slide edit times — only file-level `modifiedTime`; the marker's `at` stamp
+records when *we* last pushed each slide):
+
+| status | meaning | action |
+|--------|---------|--------|
+| `clean` / `converged` | nothing changed, or both sides made the same change | — |
+| `local-edit` | markdown changed, deck untouched | `push` (normal) |
+| `live-drift` | slide edited in Google Slides | fold the printed diff into the markdown, or `push --force` to clobber |
+| `conflict` | both changed since last push | resolve the two printed diffs by hand/LLM, then `push` |
+
+Unresolved comment threads print as ready-to-paste `<!-- @Author: text -->`
+blocks on their slide (replies as extra `@Author:` lines) — paste them into the
+source, where they round-trip from then on. Threads anchor to slide objectIds,
+so a re-render orphans them: `sync` reports those too. Capture before you push.
 
 ## Markdown dialect
 
