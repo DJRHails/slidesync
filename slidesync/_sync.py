@@ -2378,6 +2378,11 @@ def cmd_sync(args):
         local = _content_lines(sl.src or "", sl.template_name) or []
         status = classify_drift(base, local, live_lines)
         if status in ("clean", "converged"):
+            if s["objectId"] != sl.object_id:
+                # Rendered text matches, but the content hash moved — a
+                # comment/notes-level local change that still needs a push.
+                logger.info(f"[notes-edit] {sl.key} — push will update it")
+                state["pushable"] = True
             continue
         if status == "local-edit":
             logger.info(f"[local-edit] {sl.key} — push will update it")

@@ -561,3 +561,15 @@ def test_force_push_does_not_churn_already_anchored_threads(env):
     _push(env, force=True)  # re-render with UNCHANGED content -> same objectIds
     assert {t["id"] for t in env.drive.threads} == stable_ids, \
         "an already-anchored thread must not be deleted/recreated"
+
+
+def test_comment_only_local_change_still_syncs(env):
+    # Converting a presenter note to an @-annotation changes no rendered text,
+    # but it changes the speaker notes + marker — sync must still push it.
+    env.path.write_text(env.path.read_text().replace(
+        "<!-- presenter note A -->", "<!-- @Ted: presenter note A -->"))
+    _sync_cmd(env)
+    slide = next(s for s in env.store.slides
+                 if any("Takeaway A" in sh["text"] for sh in s["shapes"].values()))
+    assert "presenter note A" not in slide["notes"], \
+        "the @-annotation must leave the speaker-notes pane on the next sync"
