@@ -1282,31 +1282,43 @@ def _restore_threads(drive, deck, creates) -> None:
     if not slides_with:
         return
     live = shape_comments(list_comments(drive, deck))
+    me = drive.about().get(
+        fields="user(displayName)").execute()["user"]["displayName"]
+
+    def bare(content: str) -> str:
+        # A re-created foreign thread carries its attribution in-content
+        # ("@Fabien: ..."); strip it so every generation of a thread matches.
+        return " ".join(re.sub(r"^@[^:]+:\s*", "", content).split())
+
     for s, blocks in slides_with:
         for entries in blocks:
             _author, head = entries[0]
             norm = " ".join(head.split())
-            match = next((c for c in live if not c["resolved"]
-                          and " ".join(c["content"].split()) == norm), None)
-            if match is None or match["page"] == s.object_id:
+            matches = [c for c in live if not c["resolved"]
+                       and bare(c["content"]) == norm]
+            if not matches or any(c["page"] == s.object_id for c in matches):
                 continue  # resolved/deleted (don't revive) or already anchored
+            content = matches[0]["content"]
+            if matches[0]["author"] not in ("", me) \
+                    and not content.lstrip().startswith("@"):
+                content = f"@{matches[0]['author']}: {content}"
             anchor_json = json.dumps({"type": "page", "pages": [s.object_id]})
             new = drive.comments().create(
-                fileId=deck,
-                body={"content": match["content"], "anchor": anchor_json},
+                fileId=deck, body={"content": content, "anchor": anchor_json},
                 fields="id").execute()
-            for r in match["replies"]:
+            for r in matches[0]["replies"]:
                 drive.replies().create(
                     fileId=deck, commentId=new["id"],
                     body={"content": f"@{r['author']}: {r['content']}"
-                          if r["author"] else r["content"]},
+                          if r["author"] not in ("", me) else r["content"]},
                     fields="id").execute()
-            try:
-                drive.comments().delete(fileId=deck,
-                                        commentId=match["id"]).execute()
-            except Exception as exc:  # noqa: BLE001 — foreign-authored thread
-                logger.warning(f"left dangling thread {match['id']} in place "
-                               f"(not deletable): {exc}")
+            for c in matches:  # retire every stale copy we are allowed to
+                try:
+                    drive.comments().delete(fileId=deck,
+                                            commentId=c["id"]).execute()
+                except Exception as exc:  # noqa: BLE001 — foreign-authored
+                    logger.warning(f"left dangling thread {c['id']} by "
+                                   f"{c['author']} in place (not deletable): {exc}")
             logger.info(f"re-anchored comment thread on '{s.key}'")
 
 

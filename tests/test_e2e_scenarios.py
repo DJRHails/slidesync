@@ -168,13 +168,16 @@ class _FakeComments:
 
     def create(self, fileId, body=None, fields=None):
         def go():
-            self.d.add_raw(body.get("anchor"), body["content"])
+            self.d.add_raw(body.get("anchor"), body["content"], author=self.d.me)
             return {"id": self.d.threads[-1]["id"]}
         return _Req(go)
 
     def delete(self, fileId, commentId):
         def go():
-            self.d.threads = [t for t in self.d.threads if t["id"] != commentId]
+            t = next(t for t in self.d.threads if t["id"] == commentId)
+            if t["author"]["displayName"] != self.d.me:
+                raise RuntimeError("403: insufficient permissions")  # like Drive
+            self.d.threads.remove(t)
             return {}
         return _Req(go)
 
@@ -193,6 +196,8 @@ class _FakeReplies:
 
 
 class FakeDrive:
+    me = "Daniel Hails"  # the authenticated account's display name
+
     def __init__(self):
         self.threads = []  # raw Drive comment dicts
         self.n = 0
@@ -202,6 +207,10 @@ class FakeDrive:
 
     def replies(self):
         return _FakeReplies(self)
+
+    def about(self):
+        return SimpleNamespace(get=lambda fields=None: _Req(
+            lambda: {"user": {"displayName": self.me}}))
 
     def add_raw(self, anchor, content, author="Daniel Hails"):
         self.n += 1
@@ -492,3 +501,54 @@ def test_resolved_threads_are_not_revived(env):
     _sync_cmd(env)
     assert all(t.get("resolved") for t in env.drive.threads), \
         "push must not re-create resolved threads"
+
+
+def test_foreign_thread_mirrors_with_attribution_and_survives_rerenders(env):
+    # Fabien (not the authenticated account) comments on a slide.
+    env.drive.add(env.store.oid_of("Takeaway A"), "have you controlled for length?",
+                  author="Fabien")
+    _sync_cmd(env)
+    # Mirrored with HIS name, kept out of the speaker notes.
+    text = env.path.read_text()
+    assert "<!-- @Fabien: have you controlled for length? -->" in text
+    slide = next(s for s in env.store.slides
+                 if any("Takeaway A" in sh["text"] for sh in s["shapes"].values()))
+    assert "controlled for length" not in slide["notes"]
+    # Re-anchored copy exists on the current page, attributed in-content; the
+    # undeletable foreign original may dangle, but the count must stay BOUNDED
+    # across further re-render cycles (no duplication).
+    def live_pages():
+        return {json.loads(t["anchor"])["pages"][0] for t in env.drive.threads}
+    assert slide["id"] in live_pages()
+    n_after_first = len(env.drive.threads)
+    for marker in ("cycle two", "cycle three"):
+        env.path.write_text(env.path.read_text().replace(
+            "One solid point", f"One solid point ({marker})"))
+        _sync_cmd(env)
+    assert len(env.drive.threads) == n_after_first, "threads must not duplicate"
+    current = next(s for s in env.store.slides
+                   if any("Takeaway A" in sh["text"] for sh in s["shapes"].values()))
+    assert current["id"] in live_pages(), "thread follows the slide across renders"
+    anchored = [t for t in env.drive.threads
+                if json.loads(t["anchor"])["pages"][0] == current["id"]]
+    assert any("@Fabien:" in t["content"] for t in anchored), \
+        "re-created head keeps Fabien's attribution in-content"
+
+
+def test_plain_attribution_notes_are_speaker_notes_not_threads(tmp_path, monkeypatch):
+    # The 2026-06-01 deck's mentor annotations are unprefixed attribution notes
+    # ("Fabien: ..."), not @-mirrors — they must stay presenter notes.
+    store, drive = FakeStore(), FakeDrive()
+    slides_api = FakeSlides(store)
+    monkeypatch.setattr(_sync, "get_services", lambda account: (slides_api, drive))
+    path = tmp_path / "deck.slidev.md"
+    path.write_text(MD.replace(
+        "<!-- presenter note A -->",
+        '<!-- Fabien: over-triggering is "the classic one." Stack-rank fixes '
+        "by difficulty / importance / access. -->"))
+    push(slides_api, drive, DECK, load_slides(path), anchor=None, prune=False,
+         base_dir=tmp_path)
+    slide = next(s for s in store.slides
+                 if any("Takeaway A" in sh["text"] for sh in s["shapes"].values()))
+    assert "over-triggering" in slide["notes"], "plain notes stay in the pane"
+    assert not drive.threads, "no comment thread is fabricated from notes"
