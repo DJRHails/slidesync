@@ -419,10 +419,48 @@ def parse_body(body: str):
     return headings, paras, image, image_alt, table, notes
 
 
+def _is_thread(comment_body: str) -> bool:
+    """Captured comment-thread mirrors (`<!-- @Author: text -->`) are Slides
+    comments, not presenter notes — they never enter the speaker-notes pane."""
+    return bool(re.match(r"\s*@\S", comment_body))
+
+
 def _extract_notes(body: str) -> str:
     parts = [m.group("body").strip() for m in COMMENT_RE.finditer(body)]
-    joined = "\n".join(p for p in parts if p)
+    joined = "\n".join(p for p in parts if p and not _is_thread(p))
     return MARKER_RE.sub("", joined).strip()
+
+
+def _notes_variants(src: str | None) -> set[str]:
+    """Normalised speaker-notes text under both conventions — with and without
+    thread mirrors — so decks pushed before threads left the pane still compare
+    as untouched."""
+    parts = [m.group("body").strip() for m in COMMENT_RE.finditer(src or "")]
+    legacy = MARKER_RE.sub("", "\n".join(p for p in parts if p)).strip()
+    return {" ".join(_extract_notes(src or "").split()), " ".join(legacy.split())}
+
+
+def _thread_blocks(src: str | None) -> list[list[tuple[str, str]]]:
+    """[(author, text), ...] per `<!-- @Author: ... -->` thread mirror in src.
+
+    The first entry is the thread head; later `@Author:` lines are replies;
+    unprefixed lines continue the previous entry (multi-line comments).
+    """
+    out = []
+    for m in COMMENT_RE.finditer(src or ""):
+        body = m.group("body").strip()
+        if not _is_thread(body):
+            continue
+        entries: list[tuple[str, str]] = []
+        for line in body.splitlines():
+            if am := re.match(r"@(?P<author>[^:@][^:]*):\s?(?P<text>.*)$", line):
+                entries.append((am.group("author"), am.group("text")))
+            elif entries:
+                author, text = entries[-1]
+                entries[-1] = (author, text + "\n" + line)
+        if entries:
+            out.append(entries)
+    return out
 
 
 def _extract_custom(body: str) -> tuple[str | None, str]:
@@ -537,8 +575,7 @@ def to_slidev(slide: Slide, include_id: bool = True) -> str:
         # paragraphs when read back.
         out.append(slide.src)
         extra = slide.notes.strip()
-        if extra and " ".join(extra.split()) != \
-                " ".join(_extract_notes(slide.src).split()):
+        if extra and " ".join(extra.split()) not in _notes_variants(slide.src):
             out.append(f"<!-- {extra} -->")
         return "\n".join(out).strip() + "\n"
     if slide.custom is not None:
@@ -1221,10 +1258,56 @@ def push(slides_api, drive, deck, source, anchor, prune, base_dir=Path("."),
     if reqs:
         _batch(slides_api, deck, reqs)
     _apply_notes(slides_api, deck, creates)
+    _restore_threads(drive, deck, creates)
     _reorder(slides_api, deck, source, anchor)
     _apply_internal_links(slides_api, deck, source)
     return {"create": len(creates), "skip": len(skips),
             "replace": len(deletes), "prune": len(pruned)}
+
+
+def _restore_threads(drive, deck, creates) -> None:
+    """Keep captured comment threads alive as real Slides comments.
+
+    A replace gives a slide a new objectId, orphaning any thread anchored to
+    the old page. For every re-created slide whose source mirrors a thread
+    (`<!-- @Author: ... -->`), find the matching unresolved live thread and, if
+    it dangles, re-create it anchored to the new page (replies as replies) and
+    delete the dangling original. API constraint: the re-created thread is
+    authored by the authenticated account. Threads resolved in Slides are NOT
+    revived — resolution is how you retire a captured comment.
+    """
+    slides_with = [(s, _thread_blocks(s.src)) for s in creates
+                   if s.src and s.custom is None and "@" in s.src]
+    slides_with = [(s, blocks) for s, blocks in slides_with if blocks]
+    if not slides_with:
+        return
+    live = shape_comments(list_comments(drive, deck))
+    for s, blocks in slides_with:
+        for entries in blocks:
+            _author, head = entries[0]
+            norm = " ".join(head.split())
+            match = next((c for c in live if not c["resolved"]
+                          and " ".join(c["content"].split()) == norm), None)
+            if match is None or match["page"] == s.object_id:
+                continue  # resolved/deleted (don't revive) or already anchored
+            anchor_json = json.dumps({"type": "page", "pages": [s.object_id]})
+            new = drive.comments().create(
+                fileId=deck,
+                body={"content": match["content"], "anchor": anchor_json},
+                fields="id").execute()
+            for r in match["replies"]:
+                drive.replies().create(
+                    fileId=deck, commentId=new["id"],
+                    body={"content": f"@{r['author']}: {r['content']}"
+                          if r["author"] else r["content"]},
+                    fields="id").execute()
+            try:
+                drive.comments().delete(fileId=deck,
+                                        commentId=match["id"]).execute()
+            except Exception as exc:  # noqa: BLE001 — foreign-authored thread
+                logger.warning(f"left dangling thread {match['id']} in place "
+                               f"(not deletable): {exc}")
+            logger.info(f"re-anchored comment thread on '{s.key}'")
 
 
 # Templates with no body region, so they cannot host an internal-link run.
@@ -2126,11 +2209,11 @@ def _clobber_risks(pres, managed, source, pruned) -> list[str]:
         if base_src is None:
             continue
         if (live_lines == _content_lines(base_src, marker.get("template"))
-                and live_notes == " ".join(_extract_notes(base_src).split())):
+                and live_notes in _notes_variants(base_src)):
             continue  # deck untouched since last push
         if (sl is not None
                 and live_lines == _content_lines(sl.src or "", sl.template_name)
-                and live_notes == " ".join((sl.notes or "").split())):
+                and live_notes in _notes_variants(sl.src or "")):
             continue  # local already carries the live edit
         out.append(sl.key if sl is not None else oid)
     return out
