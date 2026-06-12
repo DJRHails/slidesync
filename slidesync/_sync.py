@@ -2015,6 +2015,20 @@ def _diff(a: list[str], b: list[str], a_name: str, b_name: str) -> str:
     return "\n".join(difflib.unified_diff(a, b, a_name, b_name, lineterm=""))
 
 
+def _content_lines(src: str | None, template: str | None) -> list[str] | None:
+    """Markdown text lines as they would actually RENDER for this template.
+
+    graph/full slides are text-free (only the image renders), so markdown body
+    text on them can never reach the deck — comparing it against the live slide
+    would report drift forever.
+    """
+    if src is None:
+        return None
+    if (template or "").lower() in ("graph", "full"):
+        return []
+    return text_lines_md(src)
+
+
 def _live_state(s) -> tuple[list[str], str, str | None, dict]:
     """(text lines, normalised notes, base source, marker) of a live slide."""
     notes_raw = _read_notes(s)
@@ -2040,13 +2054,14 @@ def _clobber_risks(pres, managed, source, pruned) -> list[str]:
         replacing = sl is not None and sl.custom is None and sl.object_id != oid
         if not (replacing or oid in pruned) or live.get(oid) is None:
             continue
-        live_lines, live_notes, base_src, _marker_ = _live_state(live[oid])
+        live_lines, live_notes, base_src, marker = _live_state(live[oid])
         if base_src is None:
             continue
-        if (live_lines == text_lines_md(base_src)
+        if (live_lines == _content_lines(base_src, marker.get("template"))
                 and live_notes == " ".join(_extract_notes(base_src).split())):
             continue  # deck untouched since last push
-        if (sl is not None and live_lines == text_lines_md(sl.src or "")
+        if (sl is not None
+                and live_lines == _content_lines(sl.src or "", sl.template_name)
                 and live_notes == " ".join((sl.notes or "").split())):
             continue  # local already carries the live edit
         out.append(sl.key if sl is not None else oid)
@@ -2178,8 +2193,9 @@ def cmd_sync(args):
         if sl.custom is not None:
             continue  # pull-authoritative; drawings are captured by pull, not diffed
         live_lines, live_notes, base_src, marker = _live_state(s)
-        base = text_lines_md(base_src) if base_src is not None else None
-        status = classify_drift(base, text_lines_md(sl.src or ""), live_lines)
+        base = _content_lines(base_src, marker.get("template"))
+        local = _content_lines(sl.src or "", sl.template_name) or []
+        status = classify_drift(base, local, live_lines)
         if status in ("clean", "converged"):
             continue
         if status == "local-edit":

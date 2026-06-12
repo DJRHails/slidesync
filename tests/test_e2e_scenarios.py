@@ -290,3 +290,31 @@ def test_sync_recaptures_orphaned_comment_via_key_hash(env):
     _push(env)  # re-render replaces the slide; the thread's page id now dangles
     _sync_cmd(env)
     assert "<!-- @Daniel Hails: anchored before the re-render -->" in env.path.read_text()
+
+
+GRAPH_MD = MD + """
+---
+template: graph
+id: fig-placeholder
+---
+![[Bracketed placeholder alt that defeats IMAGE_RE]](../figures/missing.png)
+
+<!-- caption comment -->
+"""
+
+
+def test_graph_slides_with_unrenderable_text_stay_clean(tmp_path, monkeypatch):
+    # A graph/full slide is text-free: body text in the markdown (e.g. an image
+    # line whose bracketed alt breaks IMAGE_RE) can never render, so it must
+    # not register as drift. Regression: the live probe flagged placeholder
+    # graph slides as live-drift forever.
+    store, drive = FakeStore(), FakeDrive()
+    slides_api = FakeSlides(store)
+    monkeypatch.setattr(_sync, "get_services", lambda account: (slides_api, drive))
+    path = tmp_path / "deck.slidev.md"
+    path.write_text(GRAPH_MD)
+    push(slides_api, drive, DECK, load_slides(path), anchor=None, prune=False,
+         base_dir=tmp_path)
+    before = path.read_text()
+    cmd_sync(SimpleNamespace(source=path, deck=DECK, account=None))
+    assert path.read_text() == before  # no write-back, no conflict, no churn
