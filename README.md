@@ -66,7 +66,8 @@ is a no-op. Diff per run: identical hash → skip; same key, new content → rep
 new key → create. Removed slides are **kept** unless `--prune`. **Only `s2g_`
 slides are ever touched** — hand-authored slides are invisible to the sync. A
 hidden `<!-- s2g {...} -->` marker in speaker notes carries the human id, image
-path, and template vars so `pull` can recover them.
+path, template vars — and, for template slides, the authored body markdown
+(base64) — so `pull` recovers the source verbatim.
 
 ## Markdown dialect
 
@@ -78,7 +79,11 @@ may have its own frontmatter (`id:`, `template:`, `layout:`).
   `**bold**` / `*italic*` / `` `code` `` / `[link](url)`. GFM tables.
   `![alt](path)` images (uploaded to Drive; `alt` becomes the accessibility
   description, round-tripped on pull). Blank lines preserved as spacing.
-  `<!-- notes -->` become speaker notes.
+  `<!-- notes -->` become speaker notes — and round-trip as **comments, in
+  place**: template slides carry their authored source in the marker, so `pull`
+  re-emits each comment where it was written instead of one merged trailing
+  blob. Speaker notes edited live in Slides come back as one extra trailing
+  comment.
 - **Internal links:** `[text](#slide-id)` becomes a native Slides link to the
   slide whose `id:` (or title slug) is `slide-id`.
 
@@ -87,6 +92,9 @@ may have its own frontmatter (`id:`, `template:`, `layout:`).
 Select per slide via `template:` — native styled boxes, no in-deck templates:
 `dark`/`title`, `appendix`, `question`/`label`, `topic`, `content`,
 `graph`/`full` (single full-bleed image), `prompt`/`code` (verbatim monospace).
+Title cards (`dark`/`title`/`appendix`) render body lines as a small dimmed
+**byline** beneath the headline (e.g. `Project · Presenter`) — they still have
+no linkable body region.
 Slides with no `template:` fall back to a generative path (section /
 title+body / table / image) that also brands the background + IBM Plex.
 
@@ -113,6 +121,11 @@ Releases publish to PyPI via Trusted Publishing (OIDC) on a `v*.*.*` tag — see
   — this is a content mapper, not a CSS renderer.
 - On `pull`, the slide model holds a single image, so a slide with multiple
   images keeps the first; image `contentUrl`s from foreign decks are ephemeral.
+- Verbatim-source markers are seeded at push time, so comment preservation
+  applies from the first push with v0.2+ (older slides re-render once: the
+  content hash is now over the authored source). Generative-path slides (no
+  `template:`) still merge comments into a single trailing comment on pull,
+  since their live Slides edits — not the marker — are the source of truth.
 
 ## License
 

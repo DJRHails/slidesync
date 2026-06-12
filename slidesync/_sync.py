@@ -21,7 +21,9 @@ Idempotent sync (upsert), never a blind append:
   create. Removed slides are kept by default (`--prune` to delete).
 - Only `s2g_`-prefixed slides are ever touched; hand-authored slides are
   invisible to the sync. A tiny `<!-- s2g {...} -->` marker in speaker notes
-  carries the human id + image path so `pull` can recover them.
+  carries the human id + image path — and, for template slides, the authored
+  body markdown (base64) — so `pull` recovers the source verbatim: comments
+  stay comments, in place, instead of collapsing into one speaker-notes blob.
 
 Usage:
     bin/slidesync.py push deck.slidev.md --deck <id> [--anchor <slideId>] [--prune]
@@ -33,6 +35,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import html
 import json
@@ -81,6 +84,7 @@ INK = {"red": 0.011764706, "green": 0.02745098, "blue": 0.07058824}  # #03070F
 BODY_INK = {"red": 0.11764706, "green": 0.1254902, "blue": 0.14117648}  # #1E2024
 PAPER = {"red": 0.98039216, "green": 0.98039216, "blue": 0.98039216}  # #FAFAFA
 WHITE = {"red": 1.0, "green": 1.0, "blue": 1.0}                       # #FFFFFF
+MUTED = {"red": 0.62, "green": 0.65, "blue": 0.69}  # dimmed byline on dark cards
 LIGHT_BG, DARK_BG = PAPER, BODY_INK
 
 # ---------------------------------------------------------------------------
@@ -187,6 +191,7 @@ class Slide:
     vars: dict = field(default_factory=dict)  # extra frontmatter -> {{token}} values
     custom: str | None = None  # ```gslides``` literal Slides API requests (JSON)
     verbatim: str | None = None  # ``` ``` fenced body for prompt/code slides
+    src: str | None = None  # body markdown as authored (comments in place)
     key_hash: str = ""
     content_hash: str = ""
     object_id: str = ""
@@ -282,6 +287,7 @@ def build_slides(chunks: list[tuple[dict, str]]) -> list[Slide]:
 
 
 def build_slide(meta: dict, body: str, index: int) -> Slide:
+    authored = body.strip("\n")
     custom, body = _extract_custom(body)
     verbatim = None
     if (meta.get("template") or "").lower() in ("prompt", "code"):
@@ -299,6 +305,8 @@ def build_slide(meta: dict, body: str, index: int) -> Slide:
     slide.vars = {k: v for k, v in meta.items() if k not in RESERVED_KEYS}
     slide.custom = custom
     slide.verbatim = verbatim
+    if custom is None:  # custom slides are pull-authoritative; their source goes stale
+        slide.src = authored
     return _finalize(slide)
 
 
@@ -467,6 +475,18 @@ def to_slidev(slide: Slide, include_id: bool = True) -> str:
     out = []
     if fm:
         out += ["---"] + [f"{k}: {v}" for k, v in fm.items()] + ["---"]
+    if slide.src is not None:
+        # Authored source is the canonical render: comments stay comments, in
+        # place. Speaker notes are emitted only when they no longer match the
+        # authored comments (i.e. someone edited the notes pane in Slides) —
+        # compared whitespace-normalised, since the notes shape flattens
+        # paragraphs when read back.
+        out.append(slide.src)
+        extra = slide.notes.strip()
+        if extra and " ".join(extra.split()) != \
+                " ".join(_extract_notes(slide.src).split()):
+            out.append(f"<!-- {extra} -->")
+        return "\n".join(out).strip() + "\n"
     if slide.custom is not None:
         out += ["```gslides", slide.custom, "```"]
         if slide.notes:
@@ -553,6 +573,11 @@ def _marker(slide: Slide) -> str:
             data["body"] = body_md
         if slide.vars:
             data["vars"] = slide.vars
+        if slide.src is not None:
+            # base64: MARKER_RE is delimiter-based, so a `}` + `-->` sequence
+            # in raw authored markdown would truncate the JSON mid-string;
+            # encoding also keeps the visible notes pane free of a giant blob.
+            data["src"] = base64.b64encode(slide.src.encode()).decode()
     elif slide.layout_name and slide.layout_name not in SECTION_LAYOUTS:
         data["tpl"] = slide.layout_name
     return f"<!-- s2g {json.dumps(data, separators=(',', ':'))} -->"
@@ -664,9 +689,15 @@ def _styled_requests(slide: Slide, style: Style, image_url, image_px) -> list[di
         head_pt = _fit_headline_pt(headline_text, style.headline_pt,
                                    max_lines=style.head_lines)
         head_h = _est_lines(headline_text, head_pt) * head_pt * 1.25 / 72 + 0.1
-    # Title cards (no body, no image) vertically centre the kicker+headline.
+    # Title cards have no body region; body lines render as a small dimmed
+    # byline beneath the headline (e.g. "Project · Presenter" on a title slide).
+    byline = ""
+    if style.body_align is None and slide.paras:
+        byline = "\n".join(p.text for p in slide.paras if p.text)
+    by_h = (byline.count("\n") + 1) * 0.32 if byline else 0.0
+    # Title cards (no body, no image) vertically centre kicker+headline+byline.
     if (style.body_align is None or not slide.paras) and not slide.image:
-        block = (0.36 if kicker_text else 0) + head_h
+        block = (0.36 if kicker_text else 0) + head_h + (by_h + 0.1 if byline else 0)
         y = max(0.4, (5.63 - block) / 2)
     else:
         y = style.top
@@ -682,6 +713,11 @@ def _styled_requests(slide: Slide, style: Style, image_url, image_px) -> list[di
                           headline_text, head_pt, style.headline_rgb, True,
                           halign=head_align)
         y += head_h + 0.15
+    if byline:
+        rgb = MUTED if style.bg == DARK_BG else BODY_INK
+        reqs += _text_box(sid, sid + "_by", (0.34, y, 9.32, by_h),
+                          byline, 14, rgb, False)
+        y += by_h + 0.1
     if style.body_align and slide.paras:
         bid = sid + "_b"
         reqs.append({"createShape": {"objectId": bid, "shapeType": "TEXT_BOX",
@@ -1503,6 +1539,8 @@ def _slide_from_marker(marker: dict, notes: str) -> Slide:
     slide.kicker = marker.get("h2", "")
     slide.template_name = marker["template"]
     slide.vars = marker.get("vars", {})
+    if "src" in marker:
+        slide.src = base64.b64decode(marker["src"]).decode()
     return slide
 
 
