@@ -552,3 +552,12 @@ def test_plain_attribution_notes_are_speaker_notes_not_threads(tmp_path, monkeyp
                  if any("Takeaway A" in sh["text"] for sh in s["shapes"].values()))
     assert "over-triggering" in slide["notes"], "plain notes stay in the pane"
     assert not drive.threads, "no comment thread is fabricated from notes"
+
+
+def test_force_push_does_not_churn_already_anchored_threads(env):
+    env.drive.add(env.store.oid_of("Takeaway A"), "anchored and settled")
+    _sync_cmd(env)  # capture + re-anchor onto the current page
+    stable_ids = {t["id"] for t in env.drive.threads}
+    _push(env, force=True)  # re-render with UNCHANGED content -> same objectIds
+    assert {t["id"] for t in env.drive.threads} == stable_ids, \
+        "an already-anchored thread must not be deleted/recreated"
