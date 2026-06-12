@@ -40,17 +40,25 @@ Support path.)
 
 | Command | Purpose |
 |---------|---------|
-| `slidesync push <file.slidev.md> [--deck ID] [--new "Title"] [--anchor SLIDE] [--prune] [--force]` | markdown → Slides (rejected if it would discard live edits; `--force` overrides) |
+| `slidesync push <file.slidev.md>... [--deck ID] [--new "Title"] [--anchor SLIDE] [--prune] [--force]` | markdown → Slides (rejected if it would discard live edits; `--force` overrides) |
 | `slidesync pull <deckId> --out <file.md> [--all]` | Slides → markdown (`--all` includes non-managed slides) |
 | `slidesync roundtrip [--keep]` | self-test: push a sample, pull, assert identical |
 | `slidesync layouts <deckId>` | list a deck's theme layouts + placeholders |
 | `slidesync make-templates <deckId>` | inject branded `{{token}}` template slides |
 | `slidesync comments <deckId>` | list comment threads as JSON (page anchor, author, content, replies) |
-| `slidesync sync <file.slidev.md> [--deck ID]` | reconcile with the live deck: pull comments + live edits into the markdown, push local changes; conflicts stop it (exit 1) |
+| `slidesync sync <file.slidev.md>... [--deck ID] [--prune]` | reconcile with the live deck: pull comments + live edits into the markdown, push local changes; conflicts stop it (exit 1) |
 
 `push` resolves the target deck from (in order) `--deck`, `--new`, or a top-level
-`deck:` frontmatter key. Relative image paths resolve against the markdown file's
-directory.
+`deck:` frontmatter key. Relative image paths resolve against each slide's own
+source file.
+
+**Multi-file decks**: `push`/`sync` accept several files (e.g.
+`slidesync sync $(ls -r meetings/*.slidev.md)` — one file per meeting, newest
+first). Deck order follows the argument order; slide ids namespace as
+`<file-stem>-<id>` (`2026-06-15-overview`) so files can reuse ids; intra-file
+`[text](#id)` links rewrite to the namespaced target, while fully-qualified
+cross-file targets pass through. `sync` routes comment capture and live-edit
+write-backs into the right source file under its local id.
 
 ```bash
 slidesync push deck.slidev.md            # targets `deck:` frontmatter
