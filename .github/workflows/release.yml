@@ -9,6 +9,7 @@ on:
   push:
     tags:
       - "v*.*.*"
+      - "[0-9]*.[0-9]*.[0-9]*"  # bumpver tags without the v prefix
   workflow_dispatch: {}
 
 permissions:
