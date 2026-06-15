@@ -58,6 +58,8 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from loguru import logger
 
+from slidesync._mermaid import render_mermaid
+
 GOGCLI_CRED = Path.home() / "Library/Application Support/gogcli/credentials.json"
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 SCOPES = [
@@ -186,6 +188,7 @@ class Slide:
     paras: list[Para] = field(default_factory=list)
     image: str | None = None
     image_alt: str = ""  # ![alt](path) -> image description / accessibility alt text
+    mermaid: str | None = None  # ```mermaid``` source, rendered to a PNG on push
     table: list[list[str]] | None = None
     notes: str = ""
     kicker: str = ""  # h2 above an h1 -> {{h2}} kicker
@@ -238,6 +241,13 @@ CUSTOM_RE = re.compile(
     r"""(?msx)              # multiline, dotall, verbose
     ^```\ *g?slides\ *\n    # fence opening with a gslides/slides lang tag
     (?P<json>.*?)           # the literal Slides API requests (JSON)
+    \n```\ *$               # fence close
+    """
+)
+MERMAID_RE = re.compile(
+    r"""(?msx)              # multiline, dotall, verbose
+    ^```\ *mermaid\ *\n     # fence opening with a mermaid lang tag
+    (?P<diagram>.*?)        # the diagram source (rendered to a PNG on push)
     \n```\ *$               # fence close
     """
 )
@@ -346,13 +356,13 @@ def build_slide(meta: dict, body: str, index: int) -> Slide:
     verbatim = None
     if (meta.get("template") or "").lower() in ("prompt", "code"):
         verbatim, body = _extract_verbatim(body)
-    headings, paras, image, image_alt, table, notes = parse_body(body)
+    headings, paras, image, image_alt, mermaid, table, notes = parse_body(body)
     h1, h2 = headings.get(1), headings.get(2)
     title = h1 or h2 or ""           # h1 is the headline; a lone h2 is the title
     kicker = h2 if (h1 and h2) else ""  # an h2 above an h1 is the kicker
     key = meta.get("id") or _slug(title) or f"slide{index}"
-    slide = Slide(key, _layout_of(meta, image, table), title, paras, image,
-                  image_alt, table, notes)
+    slide = Slide(key, _layout_of(meta, image or mermaid, table), title, paras,
+                  image, image_alt, mermaid, table, notes)
     slide.kicker = kicker
     slide.layout_name = meta.get("layout")
     slide.template_name = "custom" if custom is not None else meta.get("template")
@@ -387,9 +397,10 @@ def _layout_of(meta: dict, image, table) -> str:
 
 
 def parse_body(body: str):
-    """Return (headings{level:text}, paras, image, table, notes)."""
+    """Return (headings{level:text}, paras, image, image_alt, mermaid, table, notes)."""
     notes = _extract_notes(body)
     body = COMMENT_RE.sub("", body)
+    mermaid, body = _extract_mermaid(body)
     body = VCLICK_RE.sub("", DIV_RE.sub("", body))
     lines = body.splitlines()
     headings, paras, image, table, image_alt = {}, [], None, None, ""
@@ -416,7 +427,7 @@ def parse_body(body: str):
     while paras and not paras[-1].text and paras[-1].depth < 0 \
             and not paras[-1].runs:
         paras.pop()
-    return headings, paras, image, image_alt, table, notes
+    return headings, paras, image, image_alt, mermaid, table, notes
 
 
 def _is_thread(comment_body: str) -> bool:
@@ -469,6 +480,14 @@ def _extract_custom(body: str) -> tuple[str | None, str]:
     if not m:
         return None, body
     return m.group("json").strip(), body[:m.start()] + body[m.end():]
+
+
+def _extract_mermaid(body: str) -> tuple[str | None, str]:
+    """Pull a ```mermaid``` block out of the body (rendered to a PNG on push)."""
+    m = MERMAID_RE.search(body)
+    if not m:
+        return None, body
+    return m.group("diagram").strip(), body[:m.start()] + body[m.end():]
 
 
 VERBATIM_RE = re.compile(  # any fenced block — captures the literal body, no parsing
@@ -1369,7 +1388,14 @@ def _warn_orphan_links(slide: Slide) -> None:
 
 
 def _resolve_image(drive, slide: Slide, base_dir=Path(".")):
-    if slide.layout != "image" or not slide.image:
+    if slide.layout != "image":
+        return None, None
+    if slide.mermaid:
+        png = render_mermaid(slide.mermaid)
+        if png is None:  # render failed — warn (in render_mermaid) and skip the graphic
+            return None, None
+        return upload_image(drive, png), png_size(png)
+    if not slide.image:
         return None, None
     p = Path(slide.image)
     if not p.is_absolute():
@@ -1696,7 +1722,7 @@ def _text_requests(eid: str, text: dict) -> list[dict]:
 
 def _slide_from_marker(marker: dict, notes: str) -> Slide:
     """Reconstruct a tagged-template slide from its notes marker (source of truth)."""
-    _headings, paras, _, _, _, _ = parse_body(marker.get("body", ""))
+    _headings, paras, _, _, _, _, _ = parse_body(marker.get("body", ""))
     img = marker.get("img")
     slide = Slide(marker["id"], "image" if img else "content",
                   marker.get("h1", ""), paras, image=img, notes=notes)
@@ -2128,7 +2154,7 @@ def cmd_comments(args):
 def text_lines_md(src: str) -> list[str]:
     """Markdown slide body -> normalised visible text lines (comments excluded)."""
     fences = [m.group("text") for m in VERBATIM_RE.finditer(src)]
-    headings, paras, _img, _alt, table, _ = parse_body(VERBATIM_RE.sub("", src))
+    headings, paras, _img, _alt, _mmd, table, _ = parse_body(VERBATIM_RE.sub("", src))
     lines = [headings[k] for k in sorted(headings)]
     lines += [p.text for p in paras]
     if table:

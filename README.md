@@ -127,6 +127,14 @@ may have its own frontmatter (`id:`, `template:`, `layout:`).
   comment.
 - **Internal links:** `[text](#slide-id)` becomes a native Slides link to the
   slide whose `id:` (or title slug) is `slide-id`.
+- **Mermaid diagrams:** a fenced ```` ```mermaid ```` block is rendered to a PNG
+  and embedded as an image (Slides has no native Mermaid renderer). Renders are
+  cached by diagram hash, so an unchanged diagram is never re-rendered or
+  re-uploaded; a render failure logs a warning and skips the graphic rather than
+  aborting the push. Backend: `mmdc` (mermaid-cli) if it's on `PATH` (offline),
+  else the [kroki.io](https://kroki.io) HTTP API (no extra dependency). The
+  diagram source lives in the markdown, so it's the source of truth — `pull`
+  recovers the rendered image, not the Mermaid source.
 
 ### Built-in brand kit (IBM Plex; red `#C0392B` kicker)
 
