@@ -71,6 +71,55 @@ def test_bullet_nesting_is_preserved():
     assert "- Parent" in md and "\n  - Child" in md and "\n    - Grandchild" in md
 
 
+def test_bullets_after_bold_paragraph_header_survive_pull():
+    """Interleaved `**Header**` paragraphs + bullet groups must keep every bullet.
+
+    The terminology/glossary deck pattern is a non-bulleted (bold) sub-header
+    followed by a bullet list, repeated. Regression guard: pull must not flatten
+    the bullets that follow a header into plain paragraphs or drop them.
+    """
+    s = _slide([
+        _shape(0.4, 0.34, 18, [(None, "TERMS")], placeholder="TITLE"),
+        _shape(1.0, 0.34, 18, [
+            (None, "Prompt calibration"),            # bold header (non-bullet)
+            (0, "length-matched"), (0, "score vs boolean"),
+            (None, ""),                              # blank spacer line
+            (None, "Attack library"),                # bold header (non-bullet)
+            (0, "HONLY"), (0, "refuse-then-fall-back"),
+        ]),
+    ])
+    slide = _slide_from_native(s)
+    assert [(p.depth >= 0, p.text) for p in slide.paras if p.text] == [
+        (False, "Prompt calibration"),
+        (True, "length-matched"), (True, "score vs boolean"),
+        (False, "Attack library"),
+        (True, "HONLY"), (True, "refuse-then-fall-back"),
+    ]
+    md = to_slidev(slide)
+    for bullet in ("length-matched", "score vs boolean", "HONLY",
+                   "refuse-then-fall-back"):
+        assert f"- {bullet}" in md, f"bullet dropped on pull: {bullet}"
+
+
+def test_push_bullets_exclude_an_interleaved_bold_header():
+    """The push side must not pull a bold header into an adjacent bullet range."""
+    from slidesync._sync import _body, parse_body
+
+    _h, paras, *_ = parse_body(
+        "**Prompt calibration**\n- a\n- b\n\n**Attack library**\n- c\n- d\n")
+    reqs = _body("B", paras)
+    text = next(r["insertText"]["text"] for r in reqs if "insertText" in r)
+    units = text.encode("utf-16-le")
+    covered = "".join(
+        units[r["createParagraphBullets"]["textRange"]["startIndex"] * 2:
+              r["createParagraphBullets"]["textRange"]["endIndex"] * 2].decode("utf-16-le")
+        for r in reqs if "createParagraphBullets" in r)
+    assert "Prompt calibration" not in covered
+    assert "Attack library" not in covered
+    for bullet in ("a", "b", "c", "d"):
+        assert bullet in covered
+
+
 def test_title_placeholder_wins_over_font_size():
     s = _slide([
         _shape(2.0, 0.7, 48, [(None, "Huge body")]),               # bigger font...
