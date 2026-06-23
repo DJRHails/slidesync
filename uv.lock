@@ -600,7 +600,7 @@ wheels = [
 
 [[package]]
 name = "slidesync"
-version = "0.6.2"
+version = "0.8.0"
 source = { editable = "." }
 dependencies = [
     { name = "google-api-python-client" },
