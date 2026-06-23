@@ -50,6 +50,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TypedDict
 
 import frontmatter
 from google.auth.transport.requests import Request
@@ -91,6 +92,11 @@ PAPER = {"red": 0.98039216, "green": 0.98039216, "blue": 0.98039216}  # #FAFAFA
 WHITE = {"red": 1.0, "green": 1.0, "blue": 1.0}                       # #FFFFFF
 MUTED = {"red": 0.62, "green": 0.65, "blue": 0.69}  # dimmed byline on dark cards
 LIGHT_BG, DARK_BG = PAPER, BODY_INK
+
+# Desired body size for styled-template bullet bodies. Set explicitly (rather
+# than inheriting the Slides text-box default) so rendering is deterministic and
+# so `_fit_paras_pt` has a known ceiling to shrink down from when content is long.
+BODY_PT = 18
 
 # ---------------------------------------------------------------------------
 # Auth (borrowed from gog)
@@ -562,6 +568,7 @@ def _inline_inner(tok: str):
         return tok[1:-1], "code", None
     if tok.startswith("["):
         m = re.match(r"\[([^\]]+)\]\(([^)]+)\)", tok)
+        assert m is not None  # tok already matched INLINE_RE's link alternative
         return m.group(1), "link", m.group(2)
     return tok[1:-1], "italic", None
 
@@ -693,7 +700,7 @@ def _marker(slide: Slide) -> str:
     # Last-push stamp: `sync` reports it alongside drift. The Slides/Drive APIs
     # have no per-slide edit times (file-level modifiedTime only), so this is
     # the only per-slide timestamp that exists.
-    data["at"] = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    data["at"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     return f"<!-- s2g {json.dumps(data, separators=(',', ':'))} -->"
 
 
@@ -788,6 +795,41 @@ def _fit_headline_pt(text: str, base_pt: int, max_lines: int = 2,
     return pt
 
 
+def _est_body_lines(paras: list[Para], pt: int, width_in: float = 9.32) -> int:
+    """Estimate the wrapped line count of a bulleted/paragraph body at `pt`.
+
+    Nested bullets wrap in a narrower column (~0.375in indent per level); the
+    0.52 glyph-width factor (IBM Plex Sans regular) slightly over-counts so the
+    fitted size errs toward not overflowing. An empty paragraph counts as one
+    line — it reproduces the blank-line spacing authored between sections.
+    """
+    rows = 0
+    for p in paras:
+        indent = (p.depth + 1) * 0.375 if p.depth >= 0 else 0.0
+        cpl = max(1, int(max(width_in - indent, 2.0) * 72 / (pt * 0.52)))
+        rows += max(1, math.ceil(len(p.text) / cpl)) if p.text else 1
+    return rows
+
+
+def _body_height_in(paras: list[Para], pt: int, width_in: float = 9.32) -> float:
+    """Estimated rendered height (inches) of a body at `pt` — ~1.2x line spacing."""
+    return _est_body_lines(paras, pt, width_in) * pt * 1.2 / 72
+
+
+def _fit_paras_pt(paras: list[Para], base: int = BODY_PT, floor: int = 12,
+                  width_in: float = 9.32, height_in: float = 4.8) -> int:
+    """Largest body size (base..floor) at which the paragraphs fit the box.
+
+    Mirrors `_fit_headline_pt`/`_fit_body_pt`: steps down 1pt at a time from the
+    desired `base` until the estimated height fits, never below a readable
+    `floor`. Returns `floor` when even that overflows (the caller warns).
+    """
+    for pt in range(base, floor - 1, -1):
+        if _body_height_in(paras, pt, width_in) <= height_in:
+            return pt
+    return floor
+
+
 def _styled_requests(slide: Slide, style: Style, image_url, image_px) -> list[dict]:
     sid = slide.object_id
     reqs = [{"createSlide": {"objectId": sid,
@@ -800,6 +842,7 @@ def _styled_requests(slide: Slide, style: Style, image_url, image_px) -> list[di
     head_h = 0.0
     head_pt = style.headline_pt
     if headline_text:
+        assert style.headline_pt is not None  # headline_text is truthy only here
         head_pt = _fit_headline_pt(headline_text, style.headline_pt,
                                    max_lines=style.head_lines)
         head_h = _est_lines(headline_text, head_pt) * head_pt * 1.25 / 72 + 0.1
@@ -834,14 +877,22 @@ def _styled_requests(slide: Slide, style: Style, image_url, image_px) -> list[di
         y += by_h + 0.1
     if style.body_align and slide.paras:
         bid = sid + "_b"
+        box_h = max(5.2 - y, 1.0)
         reqs.append({"createShape": {"objectId": bid, "shapeType": "TEXT_BOX",
             "elementProperties": {"pageObjectId": sid,
                 "size": {"width": {"magnitude": _emu(9.32), "unit": "EMU"},
-                         "height": {"magnitude": _emu(max(5.2 - y, 1.0)),
-                                    "unit": "EMU"}},
+                         "height": {"magnitude": _emu(box_h), "unit": "EMU"}},
                 "transform": {"scaleX": 1, "scaleY": 1, "translateX": _emu(0.34),
                               "translateY": _emu(y), "unit": "EMU"}}}})
-        reqs += _body(bid, slide.paras, align=style.body_align)
+        body_pt = _fit_paras_pt(slide.paras, height_in=box_h)
+        if _body_height_in(slide.paras, body_pt) > box_h:
+            sys.exit(f"slide '{slide.key}': body overflows the slide even at "
+                     f"{body_pt}pt (the minimum readable size) — split it across "
+                     "slides or trim the content")
+        if body_pt < BODY_PT:
+            logger.warning(f"slide '{slide.key}': body auto-shrunk "
+                           f"{BODY_PT}->{body_pt}pt to fit")
+        reqs += _body(bid, slide.paras, align=style.body_align, size=body_pt)
     if slide.image and image_url:
         avail = _emu(max(5.4 - y, 1.5))
         w, h = _fit2(image_px, _emu(9.32), avail)
@@ -900,6 +951,7 @@ def _custom_requests(slide: Slide) -> list[dict]:
     [...]}`. The page is created blank; `__PAGE__` in the JSON is substituted
     with this slide's objectId (so element ids embedding it stay unique).
     """
+    assert slide.custom is not None  # only called for custom (```gslides```) slides
     sid = slide.object_id
     reqs = [{"createSlide": {"objectId": sid,
                              "slideLayoutReference": {"predefinedLayout": "BLANK"}}}]
@@ -1060,18 +1112,26 @@ def _insert(obj_id, text) -> list[dict]:
     return [{"insertText": {"objectId": obj_id, "text": text}}] if text else []
 
 
-def _body(bid: str, paras: list[Para], align: str = "START") -> list[dict]:
+def _body(bid: str, paras: list[Para], align: str = "START",
+          size: int | None = None) -> list[dict]:
     lines = ["\t" * max(p.depth, 0) + p.text for p in paras]
     full = "\n".join(lines)
     if not full:
         return []
     reqs = [{"insertText": {"objectId": bid, "text": full}},
             _font_all(bid, BODY_INK)]  # base brand font; inline runs override below
+    # Styled templates pass an explicit size (auto-fit to the box); placeholder
+    # paths leave it None so the layout's own autofit governs the body.
+    if size is not None:
+        reqs.append({"updateTextStyle": {"objectId": bid,
+            "textRange": {"type": "ALL"},
+            "style": {"fontSize": {"magnitude": size, "unit": "PT"}},
+            "fields": "fontSize"}})
     bullets, off = [], 0
     for line, p in zip(lines, paras):
         cbase = off + _u16("\t" * max(p.depth, 0))
         for r in p.runs:
-            if r.style == "link" and r.link.startswith("#"):
+            if r.style == "link" and r.link is not None and r.link.startswith("#"):
                 continue  # internal slide links: resolved in _apply_internal_links
             s = cbase + _u16(p.text[:r.start])
             e = cbase + _u16(p.text[:r.end])
@@ -1381,7 +1441,7 @@ def _apply_internal_links(slides_api, deck, source) -> None:
 
 
 def _warn_orphan_links(slide: Slide) -> None:
-    if any(r.style == "link" and r.link.startswith("#")
+    if any(r.style == "link" and r.link is not None and r.link.startswith("#")
            for p in slide.paras for r in p.runs):
         logger.warning(f"internal link on '{slide.key}' ignored: template "
                        f"'{slide.template_name}' has no body region")
@@ -2326,6 +2386,11 @@ def _append_to_slide_body(text: str, key: str, block: str) -> str:
     return text[:span[1]].rstrip("\n") + "\n" + block + "\n\n" + text[span[1]:]
 
 
+class _SyncState(TypedDict):
+    dirty: set[Path]   # source files mutated by captures/write-backs
+    pushable: bool     # any local-vs-live difference that a push would apply
+
+
 def cmd_sync(args):
     """Reconcile a markdown deck with its live Slides copy — applying what's safe.
 
@@ -2354,30 +2419,36 @@ def cmd_sync(args):
             by_page.setdefault(c["page"], []).append(c)
 
     texts = {p: p.read_text() for p in paths}
-    state = {"dirty": set(), "pushable": False}
-    origin_by_kh = {sl.key_hash: (sl.src_path, sl.src_key) for sl in source}
+    state: _SyncState = {"dirty": set(), "pushable": False}
+    origin_by_kh: dict[str, tuple[Path, str]] = {
+        sl.key_hash: (sl.src_path, sl.src_key)
+        for sl in source if sl.src_path is not None}  # src_path always set by load_deck
 
     def capture(origin: tuple[Path, str] | None, c: dict, page: str) -> None:
         lines = [f"@{c['author']}: {c['content']}"]
         lines += [f"@{r['author']}: {r['content']}" for r in c["replies"]]
         block = "<!-- " + "\n".join(lines) + " -->"
-        path, key = origin if origin else (None, None)
-        if path and " ".join(c["content"].split()) in " ".join(texts[path].split()):
-            return  # already captured
-        new = _append_to_slide_body(texts[path], key, block) if path else None
-        if new is not None and new != texts[path]:
-            texts[path] = new
-            state["dirty"].add(path)
-            state["pushable"] = True
-            logger.info(f"[comment   ] {key} — captured thread by {c['author']} "
-                        f"-> {path.name}")
-        else:
-            logger.warning(f"[comment   ] thread by {c['author']} on {key or page} "
-                           f"couldn't be placed; paste manually:\n{block}")
+        if origin is not None:
+            path, key = origin
+            if " ".join(c["content"].split()) in " ".join(texts[path].split()):
+                return  # already captured
+            new = _append_to_slide_body(texts[path], key, block)
+            if new != texts[path]:
+                texts[path] = new
+                state["dirty"].add(path)
+                state["pushable"] = True
+                logger.info(f"[comment   ] {key} — captured thread by {c['author']} "
+                            f"-> {path.name}")
+                return
+        key = origin[1] if origin is not None else None
+        logger.warning(f"[comment   ] thread by {c['author']} on {key or page} "
+                       f"couldn't be placed; paste manually:\n{block}")
 
     conflicts = []
     for sl in source:
-        origin = (sl.src_path, sl.src_key)
+        assert sl.src_path is not None  # load_deck sets src_path on every slide
+        src_path = sl.src_path
+        origin = (src_path, sl.src_key)
         s = live.pop(sl.key_hash, None)
         if s is None:
             logger.info(f"[missing   ] {sl.key} — push will create it")
@@ -2392,12 +2463,12 @@ def cmd_sync(args):
             live_json = (_custom_slide_from_native(s, marker, "").custom
                          if "id" in marker else None)
             if live_json and live_json.strip() != (sl.custom or "").strip():
-                new = texts[sl.src_path].replace(sl.custom, live_json, 1)
-                if new != texts[sl.src_path]:
-                    texts[sl.src_path] = new
-                    state["dirty"].add(sl.src_path)
+                new = texts[src_path].replace(sl.custom, live_json, 1)
+                if new != texts[src_path]:
+                    texts[src_path] = new
+                    state["dirty"].add(src_path)
                     logger.info(f"[drawing   ] {sl.key} — captured live drawing "
-                                f"-> {sl.src_path.name}")
+                                f"-> {src_path.name}")
             continue
         live_lines, live_notes, base_src, marker = _live_state(s)
         base = _content_lines(base_src, marker.get("template"))
@@ -2419,14 +2490,14 @@ def cmd_sync(args):
                    and marker.get("template") else None)
         if rebuilt and (rebuilt.title or rebuilt.paras or rebuilt.verbatim):
             rebuilt.notes = " ".join(MARKER_RE.sub("", _read_notes(s)).split())
-            new = _replace_slide_body(texts[sl.src_path], sl.src_key,
+            new = _replace_slide_body(texts[src_path], sl.src_key,
                                       _render_body(rebuilt))
-            if new != texts[sl.src_path]:
-                texts[sl.src_path] = new
-                state["dirty"].add(sl.src_path)
+            if new != texts[src_path]:
+                texts[src_path] = new
+                state["dirty"].add(src_path)
                 state["pushable"] = True
                 logger.info(f"[pulled    ] {sl.key} — live edit written back "
-                            f"-> {sl.src_path.name}")
+                            f"-> {src_path.name}")
                 continue
         conflicts.append(sl.key)
         logger.error(f"[conflict  ] {sl.key} (pushed {marker.get('at', '?')}) — "
