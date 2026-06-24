@@ -1341,6 +1341,39 @@ def plan_sync(source: list[Slide], managed: dict, prune: bool, force: bool = Fal
     return creates, deletes, skips, pruned
 
 
+def _swap_requests(new_reqs: list[dict], new_id: str, old_id: str,
+                   old_index: int) -> list[dict]:
+    """Blue-green swap for one replaced slide, as a single ordered run.
+
+    A content change gives a slide a new objectId (the content_hash moves). Rather
+    than delete the old object then re-create the new one — which leaves a window
+    where the slide is momentarily absent (and, on a batch the API splits, can drop
+    it) — emit, in order: CREATE the new object (its `createSlide` + content/notes
+    requests), reposition it into the OLD slide's index, then DELETE the old object.
+    Google applies a batch's requests in order, so the create necessarily precedes
+    the position+delete and the slide is never missing or duplicated in view.
+
+    `old_index` is the old slide's index in the deck *before* this batch runs.
+    `createSlide` appends the new object at the end, so at the `updateSlidesPosition`
+    step the order is `[…, old@old_index, …, new]`; an `insertionIndex` of
+    `old_index` (computed, per the API, on the pre-move arrangement) drops the new
+    object just before the old one, and the trailing delete leaves it exactly in the
+    old slide's slot. Each swap is position-preserving for every other slide, so a
+    batch with several swaps can use each old slide's *initial* index unadjusted.
+
+    Limitation: Google Slides comments anchored to the old object's page cannot be
+    moved by the API, so this preserves the slide's POSITION, content, and speaker
+    notes and removes the gap, but does NOT carry comments over to the new object
+    (captured comment *threads* are re-anchored separately by `_restore_threads`).
+    """
+    return [
+        *new_reqs,
+        {"updateSlidesPosition": {"slideObjectIds": [new_id],
+                                  "insertionIndex": old_index}},
+        {"deleteObject": {"objectId": old_id}},
+    ]
+
+
 def push(slides_api, drive, deck, source, anchor, prune, base_dir=Path("."),
          force=False) -> dict:
     pres = slides_api.presentations().get(presentationId=deck).execute()
@@ -1360,13 +1393,39 @@ def push(slides_api, drive, deck, source, anchor, prune, base_dir=Path("."),
                      "or `push --force` to overwrite.")
     layouts = _layout_map(slides_api, deck, pres)
     templates = _template_index(slides_api, deck, pres)
-    reqs = [{"deleteObject": {"objectId": oid}} for oid in deletes + pruned]
+    # A replace's old objectId carries the slide's key_hash, which pairs it with
+    # the freshly-built slide that supersedes it (same key). A *content* change
+    # moves the content_hash, so the new objectId differs — a blue-green swap.
+    # `--force` also re-renders unchanged slides; there the content_hash (hence
+    # objectId) is identical, so there is nothing to swap into place — the old
+    # object must be deleted before its id can be re-created (a same-id refresh).
+    new_by_kh = {s.key_hash: s for s in creates}
+    swaps = {old: new_by_kh[old.split("_")[1]] for old in deletes
+             if new_by_kh[old.split("_")[1]].object_id != old}
+    refresh_ids = {old for old in deletes if old not in swaps}  # force, same id
+    swapped_in = {new.object_id for new in swaps.values()}
+    order = [s["objectId"] for s in pres.get("slides", [])]
     create_set = set(id(s) for s in creates)
+
+    def build(slide: Slide) -> list[dict]:
+        url, px = _resolve_image(drive, slide, base_dir)
+        return slide_requests(slide, url, px, layouts, templates)
+
+    # Order within the single batch: blue-green swaps FIRST (each position-
+    # preserving, so every old index stays valid across the run), then plain
+    # deletes — same-id refreshes and prunes — which shift indices and so must
+    # follow the swaps (a same-id refresh's create is appended in the loop below,
+    # after its delete frees the id), then brand-new slides (appended and ordered
+    # by the _reorder pass — a new slide has nothing to lose to a momentary gap).
+    reqs: list[dict] = []
+    for old_id, new in swaps.items():
+        reqs += _swap_requests(build(new), new.object_id, old_id,
+                               order.index(old_id))
+    reqs += [{"deleteObject": {"objectId": oid}}
+             for oid in list(refresh_ids) + pruned]
     for s in source:
-        if id(s) not in create_set:
-            continue
-        url, px = _resolve_image(drive, s, base_dir)
-        reqs += slide_requests(s, url, px, layouts, templates)
+        if id(s) in create_set and s.object_id not in swapped_in:
+            reqs += build(s)  # brand-new slides + force same-id refreshes
     if reqs:
         _batch(slides_api, deck, reqs)
     _apply_notes(slides_api, deck, creates)
