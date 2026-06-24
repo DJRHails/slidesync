@@ -233,6 +233,29 @@ def _sha10(text: str) -> str:
     return hashlib.sha1(text.encode()).hexdigest()[:10]
 
 
+def _image_bytes_hash(slide: Slide, base_dir: Path = Path(".")) -> str | None:
+    """sha10 of a slide's image FILE bytes — folded into `content_hash`.
+
+    Without this, the canonical render only carries the image *path* + alt text,
+    so a figure regenerated in place (same path, new pixels) leaves the hash
+    unchanged and the slide is skipped — the new figure never reaches Slides.
+    Hashing the bytes makes regenerated pixels move the hash, so the slide is
+    replaced and the image re-uploaded. A missing/unreadable file falls back to
+    `None` (the path string still distinguishes slides) instead of crashing.
+    """
+    p = _image_path(slide, base_dir)
+    if p is None or not p.exists():
+        # No image, or a non-local ref (e.g. a pulled Drive URL) / missing file:
+        # the path string in the canonical render still distinguishes slides, and
+        # a genuinely missing local file is reported at push time.
+        return None
+    try:
+        return hashlib.sha1(p.read_bytes()).hexdigest()[:10]
+    except OSError as exc:
+        logger.warning(f"image unreadable, hashing path only: {p} ({exc})")
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Importer:  markdown -> Slide
 # ---------------------------------------------------------------------------
@@ -269,7 +292,14 @@ INLINE_RE = re.compile(
 
 
 def load_slides(path: Path) -> list[Slide]:
-    return build_slides(split_slides(path.read_text()))
+    slides = build_slides(split_slides(path.read_text()))
+    for s in slides:
+        # Record the origin and re-finalize now that it's known, so a relative
+        # `![](fig.png)` resolves against this file's dir and its bytes fold into
+        # content_hash (an in-place figure regen then re-pushes — see _finalize).
+        s.src_path, s.src_key = path, s.key
+        _finalize(s, path.parent)
+    return slides
 
 
 LOCAL_LINK_RE = re.compile(
@@ -293,9 +323,7 @@ def load_deck(paths: list[Path]) -> list[Slide]:
     and live edits back into the right file. Duplicate keys are an error.
     """
     if len(paths) == 1:
-        slides = load_slides(paths[0])
-        for s in slides:
-            s.src_path, s.src_key = paths[0], s.key
+        slides = load_slides(paths[0])  # sets src_path + folds image bytes
     else:
         slides = []
         for path in paths:
@@ -312,6 +340,7 @@ def load_deck(paths: list[Path]) -> list[Slide]:
                 meta = {**meta, "id": f"{prefix}-{src_key}"}
                 slide = build_slide(meta, LOCAL_LINK_RE.sub(relink, body), i)
                 slide.src_path, slide.src_key = path, src_key
+                _finalize(slide, path.parent)  # fold image bytes now src_path is set
                 slides.append(slide)
     seen, dupes = set(), set()
     for s in slides:
@@ -380,9 +409,13 @@ def build_slide(meta: dict, body: str, index: int) -> Slide:
     return _finalize(slide)
 
 
-def _finalize(slide: Slide) -> Slide:
+def _finalize(slide: Slide, base_dir: Path = Path(".")) -> Slide:
+    canonical = to_slidev(slide, include_id=False)
+    img_hash = _image_bytes_hash(slide, base_dir)
+    if img_hash is not None:  # fold the image bytes in so regenerated pixels re-push
+        canonical += f"\n<!-- img-bytes {img_hash} -->"
     slide.key_hash = _sha10(slide.key)
-    slide.content_hash = _sha10(to_slidev(slide, include_id=False))
+    slide.content_hash = _sha10(canonical)
     if slide.custom is not None:
         # Stable id keyed only on `id:` — native drawing edits (which never touch
         # the markdown) must not orphan the slide, since custom slides are
@@ -1447,6 +1480,22 @@ def _warn_orphan_links(slide: Slide) -> None:
                        f"'{slide.template_name}' has no body region")
 
 
+def _image_path(slide: Slide, base_dir: Path = Path(".")) -> Path | None:
+    """Filesystem path of a slide's `![alt](path)` image, or None if it has none.
+
+    Resolves a relative path against the slide's own source file (multi-file
+    decks) and otherwise against `base_dir` — the single resolution rule shared
+    by the content-hash byte-fold and the push-time upload, so both read the
+    same file.
+    """
+    if not slide.image:
+        return None
+    p = Path(slide.image)
+    if p.is_absolute():
+        return p
+    return (slide.src_path.parent if slide.src_path else base_dir) / p
+
+
 def _resolve_image(drive, slide: Slide, base_dir=Path(".")):
     if slide.layout != "image":
         return None, None
@@ -1455,13 +1504,9 @@ def _resolve_image(drive, slide: Slide, base_dir=Path(".")):
         if png is None:  # render failed — warn (in render_mermaid) and skip the graphic
             return None, None
         return upload_image(drive, png), png_size(png)
-    if not slide.image:
+    p = _image_path(slide, base_dir)
+    if p is None:
         return None, None
-    p = Path(slide.image)
-    if not p.is_absolute():
-        # Relative to the slide's own source file (multi-file decks), else the
-        # caller's base directory.
-        p = (slide.src_path.parent if slide.src_path else base_dir) / p
     if not p.exists():
         logger.warning(f"image not found, graphic skipped: {p}")
         return None, None
