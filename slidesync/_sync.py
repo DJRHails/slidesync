@@ -1606,13 +1606,28 @@ def upload_image(drive, path: Path) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _oid_to_key(pres_slides: list[dict]) -> dict[str, str]:
+    """objectId -> slide key, so an intra-deck page-link can pull back to `#key`.
+
+    Mirrors the key every slidesync slide carries in its `<!-- s2g {...} -->`
+    marker; foreign slides (no marker id) map to their objectId.
+    """
+    out = {}
+    for s in pres_slides:
+        oid = s["objectId"]
+        out[oid] = _read_marker(_read_notes(s)).get("id") or oid
+    return out
+
+
 def pull_slides(slides_api, deck, managed_only=True) -> list[Slide]:
     pres = slides_api.presentations().get(presentationId=deck).execute()
+    pres_slides = pres.get("slides", [])
+    links = _oid_to_key(pres_slides)  # resolve native page-links back to `#key`
     out = []
-    for s in pres.get("slides", []):
+    for s in pres_slides:
         if managed_only and not MANAGED_RE.match(s["objectId"]):
             continue
-        out.append(_finalize(_slide_from_native(s)))
+        out.append(_finalize(_slide_from_native(s, links)))
     return out
 
 
@@ -1632,7 +1647,7 @@ def _first_font_pt(shape) -> float:
     return 0.0
 
 
-def _slide_from_native(s) -> Slide:
+def _slide_from_native(s, links: dict[str, str] | None = None) -> Slide:
     notes_raw = _read_notes(s)
     marker = _read_marker(notes_raw)
     notes = MARKER_RE.sub("", notes_raw).strip()
@@ -1651,7 +1666,7 @@ def _slide_from_native(s) -> Slide:
         elif "image" in el:
             image_el = image_el or el
         elif el.get("shape", {}).get("text"):
-            paras = _paras_from_shape(el["shape"])
+            paras = _paras_from_shape(el["shape"], links)
             if not paras:
                 continue
             ph = el["shape"].get("placeholder", {}).get("type")
@@ -1854,7 +1869,10 @@ def _flatten(paras: list[Para]) -> str:
     return " ".join(p.text for p in paras)
 
 
-def _paras_from_shape(shape) -> list[Para]:
+def _paras_from_shape(shape, links: dict[str, str] | None = None) -> list[Para]:
+    """Native shape text -> [Para]. `links` (objectId -> slide key) lets a native
+    page-link round-trip back to an intra-deck `[text](#key)` link; without it
+    page-links read as plain text (the foreign / link-free callers)."""
     elements = shape.get("text", {}).get("textElements", [])
     paras, cur, depth, base = [], None, -1, 0
     for el in elements:
@@ -1865,7 +1883,7 @@ def _paras_from_shape(shape) -> list[Para]:
             depth = bullet.get("nestingLevel", 0) if bullet is not None else -1
             cur, base = {"text": "", "runs": []}, 0
         elif "textRun" in el and cur is not None:
-            base = _consume_run(el["textRun"], cur, base)
+            base = _consume_run(el["textRun"], cur, base, links)
     if cur is not None:
         paras.append(_finish_para(cur, depth))
     while paras and not paras[0].text and not paras[0].runs:
@@ -1875,20 +1893,37 @@ def _paras_from_shape(shape) -> list[Para]:
     return paras  # keep internal blank paragraphs for spacing
 
 
-def _consume_run(tr, cur, base) -> int:
+def _consume_run(tr, cur, base, links: dict[str, str] | None = None) -> int:
     content = tr.get("content", "").replace("\n", "")
     style = tr.get("style", {})
-    name = _style_name(style)
+    name = _style_name(style, links)
     start = base
     cur["text"] += content
     if name:
-        link = style.get("link", {}).get("url") if name == "link" else None
-        cur["runs"].append(Run(start, start + len(content), name, link))
+        cur["runs"].append(Run(start, start + len(content), name,
+                               _run_link(style, name, links)))
     return start + len(content)
 
 
-def _style_name(style) -> str | None:
-    if style.get("link", {}).get("url"):
+def _run_link(style: dict, name: str, links: dict[str, str] | None) -> str | None:
+    """Markdown link target for a styled run: a `url` link verbatim, or an
+    intra-deck page-link mapped back to `#<key>` via `links` (objectId -> key)."""
+    if name != "link":
+        return None
+    link = style.get("link", {})
+    if link.get("url"):
+        return link["url"]
+    key = (links or {}).get(link.get("pageObjectId", ""))
+    return f"#{key}" if key else None
+
+
+def _style_name(style, links: dict[str, str] | None = None) -> str | None:
+    link = style.get("link", {})
+    if link.get("url"):
+        return "link"
+    # An intra-deck page-link reads as a link only when its target resolves to a
+    # known slide key — otherwise it falls through to plain text (no broken ref).
+    if link.get("pageObjectId") and (links or {}).get(link["pageObjectId"]):
         return "link"
     if "Mono" in style.get("fontFamily", ""):
         return "code"
@@ -2362,10 +2397,12 @@ def _clobber_risks(pres, managed, source, pruned) -> list[str]:
     return out
 
 
-def _slide_from_live_boxes(s, marker: dict) -> Slide:
+def _slide_from_live_boxes(s, marker: dict,
+                           links: dict[str, str] | None = None) -> Slide:
     """Rebuild a template slide's content from its deterministically-named boxes
     (`_k` kicker, `_h` headline, `_by` byline, `_b` body), formatting runs
-    included — so live text edits can be written back into the markdown."""
+    included — so live text edits can be written back into the markdown. `links`
+    (objectId -> key) preserves intra-deck `[text](#key)` links on write-back."""
     sid = s["objectId"]
     shapes = {el.get("objectId", ""): el["shape"]
               for el in s.get("pageElements", [])
@@ -2373,7 +2410,7 @@ def _slide_from_live_boxes(s, marker: dict) -> Slide:
 
     def paras(suffix: str) -> list[Para]:
         shape = shapes.get(sid + suffix)
-        return _paras_from_shape(shape) if shape else []
+        return _paras_from_shape(shape, links) if shape else []
 
     slide = Slide(marker.get("id", sid), "content")
     slide.template_name = marker.get("template")
@@ -2458,6 +2495,7 @@ def cmd_sync(args):
     pres = slides_api.presentations().get(presentationId=deck).execute()
     live = {s["objectId"].split("_")[1]: s for s in pres.get("slides", [])
             if MANAGED_RE.match(s["objectId"])}
+    links = _oid_to_key(pres.get("slides", []))  # page-links -> `#key` on write-back
     by_page = {}
     for c in shape_comments(list_comments(drive, deck)):
         if not c["resolved"] and c["page"]:
@@ -2530,7 +2568,7 @@ def cmd_sync(args):
             logger.info(f"[local-edit] {sl.key} — push will update it")
             state["pushable"] = True
             continue
-        rebuilt = (_slide_from_live_boxes(s, marker)
+        rebuilt = (_slide_from_live_boxes(s, marker, links)
                    if status in ("live-drift", "drift-no-base")
                    and marker.get("template") else None)
         if rebuilt and (rebuilt.title or rebuilt.paras or rebuilt.verbatim):

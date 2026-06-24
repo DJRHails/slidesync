@@ -126,7 +126,8 @@ may have its own frontmatter (`id:`, `template:`, `layout:`).
   blob. Speaker notes edited live in Slides come back as one extra trailing
   comment.
 - **Internal links:** `[text](#slide-id)` becomes a native Slides link to the
-  slide whose `id:` (or title slug) is `slide-id`.
+  slide whose `id:` (or title slug) is `slide-id`, and round-trips: `pull` reads
+  the native page-link back to `[text](#slide-id)` (so it no longer churns).
 - **Mermaid diagrams:** a fenced ```` ```mermaid ```` block is rendered to a PNG
   and embedded as an image (Slides has no native Mermaid renderer). Renders are
   cached by diagram hash, so an unchanged diagram is never re-rendered or
