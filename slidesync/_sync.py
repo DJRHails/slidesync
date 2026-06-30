@@ -96,7 +96,9 @@ LIGHT_BG, DARK_BG = PAPER, BODY_INK
 # Desired body size for styled-template bullet bodies. Set explicitly (rather
 # than inheriting the Slides text-box default) so rendering is deterministic and
 # so `_fit_paras_pt` has a known ceiling to shrink down from when content is long.
-BODY_PT = 18
+# Sized for sparse, presentation-style slides (big numbers + a few bullets); long
+# bodies still auto-shrink toward the 12pt floor via `_fit_paras_pt`.
+BODY_PT = 24
 
 # ---------------------------------------------------------------------------
 # Auth (borrowed from gog)
