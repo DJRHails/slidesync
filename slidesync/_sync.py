@@ -7,9 +7,10 @@ native objects. `roundtrip` pushes a sample into a fresh deck, pulls it back,
 and asserts the two are semantically identical.
 
 Auth is borrowed from `gog` (no separate OAuth client): the client id/secret
-live in `~/Library/Application Support/gogcli/credentials.json` and the refresh
-token is exported via `gog auth tokens export`. The stored token already carries
-the `slides`+`drive` scopes.
+live in gog's credentials file — `~/.config/gogcli/credentials.json` (Linux/XDG)
+or `~/Library/Application Support/gogcli/credentials.json` (macOS) — and the
+refresh token is exported via `gog auth tokens export`. The stored token already
+carries the `slides`+`drive` scopes.
 
 Idempotent sync (upsert), never a blind append:
 
@@ -61,7 +62,19 @@ from loguru import logger
 
 from slidesync._mermaid import render_mermaid
 
-GOGCLI_CRED = Path.home() / "Library/Application Support/gogcli/credentials.json"
+# gog's OAuth client file — Linux/XDG (`~/.config/gogcli`) or macOS App Support;
+# mirrors the keyring-password lookup so slidesync auths on both platforms.
+GOGCLI_CRED = next(
+    (
+        p
+        for p in (
+            Path.home() / ".config/gogcli/credentials.json",
+            Path.home() / "Library/Application Support/gogcli/credentials.json",
+        )
+        if p.exists()
+    ),
+    Path.home() / "Library/Application Support/gogcli/credentials.json",
+)
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 SCOPES = [
     "https://www.googleapis.com/auth/presentations",

@@ -30,7 +30,7 @@ from slidesync._sync import (
     write_slidev,
 )
 
-__version__ = "0.8.2"
+__version__ = "0.8.3"
 
 __all__ = [
     "Para",
