@@ -2915,18 +2915,28 @@ def _capture_washes(text: str, sl, restyled) -> str | None:
     live copy are written back, by exact-text substitution in the authored
     block — never a body re-render, which would normalise away authored
     formatting the read-back can't reproduce (comments, captions, fences).
-    Returns the updated file text, or None when nothing could be mapped.
+    A wash is substituted only where its text occurs exactly once in the
+    block, so an ambiguous match (e.g. the same words inside a note comment)
+    can never wrap the wrong occurrence. Returns the updated file text, or
+    None when nothing could be mapped.
     """
-    if not sl.src or text.count(sl.src) != 1:
-        return None
     have = set(_wash_texts(sl.paras))
+    new = [t for t in dict.fromkeys(_wash_texts(restyled.paras)) if t not in have]
+    if not new:
+        return None
+    if not sl.src or text.count(sl.src) != 1:
+        logger.warning(f"[washed    ] {sl.key} — live highlight(s) {new!r} can't "
+                       "be captured: the slide's source block isn't unique in "
+                       "the file; add ==...== by hand")
+        return None
     src_new = sl.src
-    for t in _wash_texts(restyled.paras):
-        if t in have or f"=={t}==" in src_new:
+    for t in new:
+        if f"=={t}==" in src_new:
             continue
-        if t not in src_new:
-            logger.warning(f"[washed    ] {sl.key} — live highlight on {t!r} "
-                           "has no verbatim source text; add ==...== by hand")
+        if src_new.count(t) != 1:
+            logger.warning(f"[washed    ] {sl.key} — live highlight on {t!r} has "
+                           "no unique verbatim source text; add ==...== by hand "
+                           "(the live wash won't survive a re-render)")
             continue
         src_new = src_new.replace(t, f"=={t}==", 1)
     return text.replace(sl.src, src_new, 1) if src_new != sl.src else None
