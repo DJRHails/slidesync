@@ -376,6 +376,46 @@ def test_graph_slides_with_unrenderable_text_stay_clean(tmp_path, monkeypatch):
     assert path.read_text() == before  # no write-back, no conflict, no churn
 
 
+EQUATION_MD = MD + """
+---
+template: equation
+id: objective
+---
+## THE OBJECTIVE
+
+# Headline parsed but never rendered
+
+$$
+\\max_{\\pi} \\; E[r]
+$$
+
+Maximise reward under the monitor budget.
+"""
+
+
+def test_equation_slides_with_a_dropped_h1_stay_clean(tmp_path, monkeypatch):
+    # The equation template renders only the kicker + equation + caption; the
+    # `# h1` is parsed but never reaches the deck, so it must not register as
+    # live-drift (the graph/full regression, replayed for `template: equation`).
+    store, drive = FakeStore(), FakeDrive()
+    slides_api = FakeSlides(store)
+    monkeypatch.setattr(_sync, "get_services", lambda account: (slides_api, drive))
+    monkeypatch.setattr(  # the fake Drive can't host the rendered PNG
+        _sync, "_resolve_equations",
+        lambda drive, slide: [(src, f"https://img/{i}", (1800, 600))
+                              for i, src in enumerate(slide.equations)])
+    path = tmp_path / "deck.slidev.md"
+    path.write_text(EQUATION_MD)
+    push(slides_api, drive, DECK, load_slides(path), anchor=None, prune=False,
+         base_dir=tmp_path)
+    live = store.all_text()
+    assert "THE OBJECTIVE" in live and "Maximise reward" in live
+    assert "Headline parsed but never rendered" not in live
+    before = path.read_text()
+    cmd_sync(SimpleNamespace(source=path, deck=DECK, account=None, prune=False))
+    assert path.read_text() == before  # no write-back, no conflict, no churn
+
+
 WEEK_A = """---
 theme: seriph
 ---

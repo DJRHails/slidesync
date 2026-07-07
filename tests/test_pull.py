@@ -120,6 +120,41 @@ def test_push_bullets_exclude_an_interleaved_bold_header():
         assert bullet in covered
 
 
+def test_highlight_wash_pulls_back_to_double_equals():
+    bg = {"backgroundColor": {"opaqueColor": {"rgbColor": {
+        "red": 1.0, "green": 0.8784314, "blue": 0.5411765}}}}
+    s = _slide([
+        _shape(0.5, 0.7, 30, [(None, "Title")], placeholder="TITLE"),
+        {"transform": {"translateY": 2.0 * IN, "translateX": 0.7 * IN},
+         "shape": {"text": {"textElements": [
+             {"paragraphMarker": {}},
+             {"textRun": {"content": "the ", "style": {}}},
+             {"textRun": {"content": "headline effect", "style": bg}},
+             {"textRun": {"content": " survives\n", "style": {}}}]}}},
+    ])
+    slide = _slide_from_native(s)
+    [run] = [r for p in slide.paras for r in p.runs]
+    assert run.style == "highlight"
+    assert "the ==headline effect== survives" in to_slidev(slide)
+
+
+def test_code_span_with_a_wash_stays_code_not_highlight():
+    # A foreign code span often carries a grey background — the Mono font must
+    # win, or pulled decks would rewrite `code` as ==code==.
+    style = {"fontFamily": "Roboto Mono",
+             "backgroundColor": {"opaqueColor": {"rgbColor": {"red": 0.9}}}}
+    s = _slide([
+        _shape(0.5, 0.7, 30, [(None, "Title")], placeholder="TITLE"),
+        {"transform": {"translateY": 2.0 * IN, "translateX": 0.7 * IN},
+         "shape": {"text": {"textElements": [
+             {"paragraphMarker": {}},
+             {"textRun": {"content": "pip install\n", "style": style}}]}}},
+    ])
+    slide = _slide_from_native(s)
+    runs = [r for p in slide.paras for r in p.runs]
+    assert [r.style for r in runs] == ["code"]
+
+
 def test_title_placeholder_wins_over_font_size():
     s = _slide([
         _shape(2.0, 0.7, 48, [(None, "Huge body")]),               # bigger font...

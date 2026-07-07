@@ -60,7 +60,13 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from loguru import logger
 
-from slidesync._equation import EQUATION_DPI, INK_HEX, render_equation
+from slidesync._equation import (
+    EQUATION_DPI,
+    EQUATION_FOCUS_PT,
+    EQUATION_PT,
+    INK_HEX,
+    render_equation,
+)
 from slidesync._mermaid import render_mermaid
 
 # gog's OAuth client file — Linux/XDG (`~/.config/gogcli`) or macOS App Support;
@@ -106,6 +112,11 @@ BODY_INK = {"red": 0.11764706, "green": 0.1254902, "blue": 0.14117648}  # #1E202
 PAPER = {"red": 0.98039216, "green": 0.98039216, "blue": 0.98039216}  # #FAFAFA
 WHITE = {"red": 1.0, "green": 1.0, "blue": 1.0}                       # #FFFFFF
 MUTED = {"red": 0.62, "green": 0.65, "blue": 0.69}  # dimmed byline on dark cards
+# ==highlight== runs: a warm amber wash (#FFE08A) behind the text. The run's
+# text is forced to INK (see STYLE), so the mark stays legible on the dark
+# templates too — dark ink on a light accent patch, rather than paper-white
+# text disappearing into a light wash.
+HIGHLIGHT = {"red": 1.0, "green": 0.8784314, "blue": 0.5411765}  # #FFE08A
 LIGHT_BG, DARK_BG = PAPER, BODY_INK
 
 # Desired body size for styled-template bullet bodies. Set explicitly (rather
@@ -320,6 +331,8 @@ INLINE_RE = re.compile(
     r"""(?x)
     (\*\*.+?\*\* | __.+?__
      | \*[^*]+?\* | _[^_]+?_
+     | ==(?:\S.*?\S|\S)==    # ==highlight== (markdown-it-mark); non-space-adjacent
+                             # delimiters, so a bare `a == b == c` stays plain text
      | `[^`]+?`
      | \[[^\]]+?\]\([^)]+?\))
     """
@@ -647,6 +660,8 @@ def parse_inline(text: str) -> tuple[str, list[Run]]:
 def _inline_inner(tok: str):
     if tok.startswith(("**", "__")):
         return tok[2:-2], "bold", None
+    if tok.startswith("=="):
+        return tok[2:-2], "highlight", None
     if tok.startswith("`"):
         return tok[1:-1], "code", None
     if tok.startswith("["):
@@ -660,7 +675,8 @@ def _inline_inner(tok: str):
 # Canonical render:  Slide -> markdown
 # ---------------------------------------------------------------------------
 
-MARKS = {"bold": ("**", "**"), "italic": ("*", "*"), "code": ("`", "`")}
+MARKS = {"bold": ("**", "**"), "italic": ("*", "*"), "code": ("`", "`"),
+         "highlight": ("==", "==")}
 
 
 def to_slidev(slide: Slide, include_id: bool = True) -> str:
@@ -806,6 +822,11 @@ STYLE = {
     "bold": ({"bold": True}, "bold"),
     "italic": ({"italic": True}, "italic"),
     "code": ({"fontFamily": "Roboto Mono"}, "fontFamily"),
+    # ==highlight==: warm amber wash behind the run; the text is pinned to INK
+    # so the mark reads as dark-on-accent everywhere, dark templates included.
+    "highlight": ({"backgroundColor": {"opaqueColor": {"rgbColor": HIGHLIGHT}},
+                   "foregroundColor": {"opaqueColor": {"rgbColor": INK}}},
+                  "backgroundColor,foregroundColor"),
 }
 
 
@@ -971,6 +992,84 @@ def _equation_requests(sid: str, equations, top_in: float, bottom_in: float,
                               "translateY": _emu(y)}}}})
         reqs.append(_alt_req(eq_id, f"$${' '.join(src.split())}$$"))
         y += h + EQ_GAP_IN * scale
+    return reqs
+
+
+# `template: equation` — the focal equation fills this fraction of the region's
+# width (the LARGE part), clamped so no single equation exceeds the height cap
+# (a trivially short `$$x$$` should read big, not fill the page).
+EQ_FOCUS_WIDTH_FRACTION = 0.85
+EQ_FOCUS_MAX_EQ_H_IN = 2.4
+
+
+def _equation_focus_requests(sid: str, equations, top_in: float, bottom_in: float,
+                             x_in: float = 0.34, width_in: float = 9.32) -> list[dict]:
+    """createImage requests for the equation template's focal `$$...$$` stack.
+
+    Unlike `_equation_requests` (natural size, downscale-only), the stack is
+    scaled UP so the widest equation fills `EQ_FOCUS_WIDTH_FRACTION` of the
+    region's width — clamped so the whole stack fits the region's height and no
+    single equation exceeds `EQ_FOCUS_MAX_EQ_H_IN`. Centred both ways; the
+    LaTeX source doubles as each image's accessibility description.
+    """
+    sizes = _eq_sizes_in(equations)
+    total = sum(h for _, h in sizes) + EQ_GAP_IN * (len(sizes) - 1)
+    avail = max(bottom_in - top_in, 0.5)
+    scale = min(EQ_FOCUS_WIDTH_FRACTION * width_in / max(w for w, _ in sizes),
+                avail / total,
+                EQ_FOCUS_MAX_EQ_H_IN / max(h for _, h in sizes))
+    y = top_in + max(0.0, (avail - total * scale) / 2)
+    reqs = []
+    for i, ((w, h), (src, url, _px)) in enumerate(zip(sizes, equations)):
+        w, h = w * scale, h * scale
+        eq_id = f"{sid}_eq{i}"
+        reqs.append({"createImage": {
+            "objectId": eq_id, "url": url,
+            "elementProperties": {"pageObjectId": sid,
+                "size": {"width": {"magnitude": _emu(w), "unit": "EMU"},
+                         "height": {"magnitude": _emu(h), "unit": "EMU"}},
+                "transform": {"scaleX": 1, "scaleY": 1, "unit": "EMU",
+                              "translateX": _emu(x_in + (width_in - w) / 2),
+                              "translateY": _emu(y)}}}})
+        reqs.append(_alt_req(eq_id, f"$${' '.join(src.split())}$$"))
+        y += h + EQ_GAP_IN * scale
+    return reqs
+
+
+def _equation_template_requests(slide: Slide, equations) -> list[dict]:
+    """`template: equation` — a full-slide focal display equation.
+
+    Layout: one red all-caps kicker at the top (the `##`, styled like
+    `content`'s kicker-as-title), the `$$...$$` stack rendered centred and
+    LARGE (`_equation_focus_requests`), and any body text as a small centred
+    caption line under the equation (the title-card byline treatment). With
+    both `# h1` and `## h2` authored, the h1 is parsed but NOT rendered — the
+    same way `graph` ignores title/body; it still round-trips via the marker.
+    """
+    sid = slide.object_id
+    reqs = [{"createSlide": {"objectId": sid,
+                             "slideLayoutReference": {"predefinedLayout": "BLANK"}}},
+            _bg(sid, LIGHT_BG)]
+    kicker_text = slide.kicker or slide.title  # h1 dropped when a kicker exists
+    y = 0.4
+    if kicker_text:
+        reqs += _text_box(sid, sid + "_k", (0.34, y, 9.32, 0.5),
+                          kicker_text, 18, RED, False)
+        y += 0.6
+    caption = "\n".join(p.text for p in slide.paras if p.text)
+    cap_h = (caption.count("\n") + 1) * 0.32 if caption else 0.0
+    eq_bottom = 5.35 - (cap_h + 0.15 if caption else 0.0)
+    if equations:
+        reqs += _equation_focus_requests(sid, equations, top_in=y,
+                                         bottom_in=eq_bottom)
+    else:
+        logger.warning(f"template: equation on '{slide.key}' has no $$...$$ block")
+    if caption:  # `_by` so a live caption edit writes back (_slide_from_live_boxes)
+        reqs += _text_box(sid, sid + "_by", (0.34, eq_bottom + 0.15, 9.32, cap_h),
+                          caption, 14, BODY_INK, False)
+    if slide.image:
+        logger.warning(f"image on '{slide.key}' ignored: the equation template "
+                       "renders only the kicker, equation, and caption")
     return reqs
 
 
@@ -1191,6 +1290,8 @@ def slide_requests(slide: Slide, image_url, image_px,
     if tpl in ("prompt", "code"):
         _warn_dropped_equations(slide, "prompt/code")
         return _prompt_requests(slide)
+    if tpl == "equation":
+        return _equation_template_requests(slide, equations)
     if tpl in STYLES:
         return _styled_requests(slide, STYLES[tpl], image_url, image_px,
                                 equations=equations)
@@ -1635,8 +1736,9 @@ def _restore_threads(drive, deck, creates) -> None:
             logger.info(f"re-anchored comment thread on '{s.key}'")
 
 
-# Templates with no body region, so they cannot host an internal-link run.
-NOBODY_TEMPLATES = {"dark", "title", "appendix", "graph", "full"}
+# Templates with no body region, so they cannot host an internal-link run
+# (the equation template's caption renders as plain text, runs dropped).
+NOBODY_TEMPLATES = {"dark", "title", "appendix", "graph", "full", "equation"}
 
 
 def _apply_internal_links(slides_api, deck, source) -> None:
@@ -1711,9 +1813,11 @@ def _resolve_equations(drive, slide: Slide) -> list[tuple[str, str, tuple]]:
     A render failure (construct outside the mathtext subset) is warned about in
     `render_equation` and that equation is skipped, not the whole push.
     """
+    focal = (slide.template_name or "").lower() == "equation"
+    pt = EQUATION_FOCUS_PT if focal else EQUATION_PT
     out = []
     for src in slide.equations:
-        png = render_equation(src, color=_equation_ink(slide))
+        png = render_equation(src, color=_equation_ink(slide), pt=pt)
         if png is None:
             continue
         out.append((src, upload_image(drive, png), png_size(png)))
@@ -2180,6 +2284,10 @@ def _style_name(style, links: dict[str, str] | None = None) -> str | None:
         return "link"
     if "Mono" in style.get("fontFamily", ""):
         return "code"
+    # After code (a foreign code span often carries a grey wash — keep it code),
+    # before bold/italic (our own pushed highlights are never bold/italic).
+    if style.get("backgroundColor", {}).get("opaqueColor"):
+        return "highlight"
     if style.get("bold"):
         return "bold"
     if style.get("italic"):
@@ -2374,6 +2482,7 @@ id: findings
   - nested with `code`
   - nested with *italic*
 - Second point with a [link](https://example.com)
+- The ==headline effect== survives, mixed with **bold**
 
 <!-- talk through each finding -->
 
@@ -2399,6 +2508,21 @@ Monitor effectiveness factors:
 $$
 E = p_{mon} \\times r_{mon} \\times (1 - FPR) \\times r_{hum}
 $$
+
+---
+template: equation
+id: objective
+---
+
+## THE OBJECTIVE
+
+# This headline is parsed but not rendered
+
+$$
+\\max_{\\pi} \\; E_{\\tau}[r(\\tau)]
+$$
+
+Maximise expected reward under the monitor budget.
 
 ---
 template: label
@@ -2619,13 +2743,23 @@ def _content_lines(src: str | None, template: str | None) -> list[str] | None:
 
     graph/full slides are text-free (only the image renders), so markdown body
     text on them can never reach the deck — comparing it against the live slide
-    would report drift forever.
+    would report drift forever. The equation template drops its `# h1` (only
+    the `##` kicker renders), so that heading is removed from the comparison
+    for the same reason.
     """
     if src is None:
         return None
-    if (template or "").lower() in ("graph", "full"):
+    tpl = (template or "").lower()
+    if tpl in ("graph", "full"):
         return []
-    return text_lines_md(src)
+    lines = text_lines_md(src)
+    if tpl == "equation":
+        headings, *_ = parse_body(VERBATIM_RE.sub("", src))
+        if 1 in headings and 2 in headings:  # h1 parsed but never rendered
+            h1 = " ".join(headings[1].split())
+            if h1 in lines:
+                lines.remove(h1)
+    return lines
 
 
 def _live_state(s) -> tuple[list[str], str, str | None, dict]:
@@ -2924,7 +3058,8 @@ def _compare(src: list[Slide], got: list[Slide]) -> bool:
         for fa, fb, name in zip(a.semantic(), b.semantic(),
                                 ["key", "layout_name", "template_name", "vars",
                                  "layout", "title", "kicker", "paras", "table",
-                                 "image", "image_alt", "notes", "hidden"]):
+                                 "image", "image_alt", "notes", "hidden",
+                                 "equations"]):
             if fa != fb:
                 logger.error(f"    {name}: {fa!r} != {fb!r}")
     logger.log("SUCCESS" if ok else "ERROR",

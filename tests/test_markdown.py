@@ -1,10 +1,15 @@
 """Offline tests for the markdown parse/render path (no network/auth)."""
 
 from slidesync._sync import (
+    HIGHLIGHT,
+    INK,
     SAMPLE,
     Run,
+    _body,
     _coalesce_runs,
     build_slides,
+    parse_body,
+    parse_inline,
     render_inline,
     split_slides,
     to_slidev,
@@ -18,7 +23,7 @@ def _slide(key):
 def test_sample_parses_all_slides():
     slides = build_slides(split_slides(SAMPLE))
     assert [s.key for s in slides] == [
-        "intro", "findings", "data", "maths", "ask", "titlecard"]
+        "intro", "findings", "data", "maths", "objective", "ask", "titlecard"]
 
 
 def test_nested_bullets_round_trip_through_render():
@@ -34,6 +39,38 @@ def test_table_round_trips():
     data = _slide("data")
     assert data.table == [["Metric", "Value"], ["AUROC", "0.93"], ["Gap", "small"]]
     assert "| Metric | Value |" in to_slidev(data)
+
+
+def test_highlight_parses_to_a_run_and_renders_back():
+    clean, runs = parse_inline("the ==headline effect== survives")
+    assert clean == "the headline effect survives"
+    assert [(r.start, r.end, r.style) for r in runs] == [(4, 19, "highlight")]
+    assert render_inline(clean, runs) == "the ==headline effect== survives"
+
+
+def test_highlight_composes_with_other_inline_styles():
+    src = "==marked== and **bold** and `code` and [x](https://e.com)"
+    clean, runs = parse_inline(src)
+    assert [r.style for r in runs] == ["highlight", "bold", "code", "link"]
+    assert render_inline(clean, runs) == src  # byte-identical round-trip
+
+
+def test_bare_double_equals_is_not_a_highlight():
+    # markdown-it-mark needs non-space-adjacent delimiters: `a == b == c` is
+    # comparison prose, not a highlight of " b ".
+    clean, runs = parse_inline("if a == b == c holds")
+    assert clean == "if a == b == c holds" and runs == []
+
+
+def test_highlight_run_pushes_a_background_wash():
+    _h, paras, *_ = parse_body("a ==marked== word\n")
+    styles = [r["updateTextStyle"] for r in _body("B", paras)
+              if "updateTextStyle" in r
+              and r["updateTextStyle"]["textRange"]["type"] == "FIXED_RANGE"]
+    [st] = styles
+    assert st["style"]["backgroundColor"]["opaqueColor"]["rgbColor"] == HIGHLIGHT
+    assert st["style"]["foregroundColor"]["opaqueColor"]["rgbColor"] == INK
+    assert st["fields"] == "backgroundColor,foregroundColor"
 
 
 def test_coalesce_adjacent_same_style_runs():

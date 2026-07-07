@@ -186,7 +186,7 @@ def test_render_caches_by_source_hash(tmp_path, monkeypatch):
     calls = []
     real = equation._render_mathtext
     monkeypatch.setattr(equation, "_render_mathtext",
-                        lambda src, color: calls.append(src) or real(src, color))
+                        lambda src, color, pt: calls.append(src) or real(src, color, pt))
     first = render_equation("x^2 + y^2 = z^2")
     second = render_equation("x^2 + y^2 = z^2")
     assert first == second and first.exists()
@@ -196,3 +196,135 @@ def test_render_caches_by_source_hash(tmp_path, monkeypatch):
 def test_render_failure_returns_none(tmp_path, monkeypatch):
     monkeypatch.setattr(equation, "EQUATION_CACHE_DIR", tmp_path)
     assert render_equation(r"\notamathtextcommand{x}") is None
+
+
+def test_render_pt_gives_more_pixels_and_a_separate_cache_entry(tmp_path, monkeypatch):
+    from slidesync._sync import png_size
+
+    monkeypatch.setattr(equation, "EQUATION_CACHE_DIR", tmp_path)
+    small = render_equation("x^2 + y^2", pt=equation.EQUATION_PT)
+    large = render_equation("x^2 + y^2", pt=equation.EQUATION_FOCUS_PT)
+    assert small != large  # keyed on pt: focal renders don't evict body-size ones
+    assert png_size(large)[0] > 1.5 * png_size(small)[0]
+
+
+# --- template: equation ------------------------------------------------------
+
+EQ_TEMPLATE_DECK = r"""---
+theme: seriph
+---
+
+---
+template: equation
+id: objective
+---
+
+## THE OBJECTIVE
+
+# A headline that must not render
+
+$$
+\max_{\pi} \; E_{\tau}[r(\tau)]
+$$
+
+Maximise expected reward under the monitor budget.
+
+---
+template: equation
+id: bare
+---
+
+## JUST THE KICKER
+
+$$e^{i\pi} + 1 = 0$$
+"""
+
+
+def _tpl_slide(key):
+    return next(s for s in build_slides(split_slides(EQ_TEMPLATE_DECK))
+                if s.key == key)
+
+
+def _tpl_reqs(slide):
+    return slide_requests(slide, None, None, equations=_fake_resolved(slide))
+
+
+def _texts_of(reqs):
+    return [r["insertText"]["text"] for r in reqs if "insertText" in r]
+
+
+def test_equation_template_renders_kicker_not_headline():
+    slide = _tpl_slide("objective")
+    reqs = _tpl_reqs(slide)
+    texts = _texts_of(reqs)
+    assert "THE OBJECTIVE" in texts
+    assert all("A headline that must not render" not in t for t in texts)
+    assert not any(r.get("createShape", {}).get("objectId", "").endswith("_h")
+                   for r in reqs)  # no headline box at all
+    kicker = next(r["updateTextStyle"] for r in reqs
+                  if r.get("updateTextStyle", {}).get("objectId", "").endswith("_k"))
+    assert kicker["style"]["fontSize"]["magnitude"] == 18
+    assert kicker["style"]["foregroundColor"]["opaqueColor"]["rgbColor"] == \
+        {"red": 0.7529412, "green": 0.22352941, "blue": 0.16862746}  # brand red
+
+
+def test_equation_template_lone_kicker_is_the_title():
+    reqs = _tpl_reqs(_tpl_slide("bare"))
+    assert "JUST THE KICKER" in _texts_of(reqs)
+
+
+def test_equation_template_scales_the_equation_up_to_fill_the_width():
+    from slidesync._sync import EQ_FOCUS_WIDTH_FRACTION, _emu
+
+    slide = _tpl_slide("bare")
+    # 900x300 px at 300 dpi = 3.0x1.0 in natural; the focal layout must scale it
+    # UP to fill most of the 9.32 in region (height cap 2.4 in binds first here:
+    # scale = 2.4, width = 7.2 in < 7.92 in target).
+    [img] = [r["createImage"] for r in _tpl_reqs(slide) if "createImage" in r]
+    w = img["elementProperties"]["size"]["width"]["magnitude"]
+    assert w == _emu(3.0 * 2.4)  # far larger than natural (3.0 in)
+    assert w <= _emu(EQ_FOCUS_WIDTH_FRACTION * 9.32)
+
+
+def test_equation_template_caption_sits_below_the_equation():
+    slide = _tpl_slide("objective")
+    reqs = _tpl_reqs(slide)
+    caption = next(r["createShape"] for r in reqs
+                   if r.get("createShape", {}).get("objectId", "").endswith("_by"))
+    [img] = [r["createImage"] for r in reqs if "createImage" in r]
+    cap_y = caption["elementProperties"]["transform"]["translateY"]
+    eq_y = img["elementProperties"]["transform"]["translateY"]
+    eq_h = img["elementProperties"]["size"]["height"]["magnitude"]
+    assert cap_y >= eq_y + eq_h  # caption strip is reserved under the stack
+    assert "Maximise expected reward under the monitor budget." in _texts_of(reqs)
+
+
+def test_equation_template_round_trips_via_the_marker():
+    slide = _tpl_slide("objective")
+    native = {
+        "objectId": slide.object_id,
+        "pageElements": [],
+        "slideProperties": {"notesPage": {
+            "notesProperties": {"speakerNotesObjectId": "n"},
+            "pageElements": [{"objectId": "n", "shape": {"text": {"textElements": [
+                {"paragraphMarker": {}},
+                {"textRun": {"content": _marker(slide)}},
+            ]}}}],
+        }},
+    }
+    pulled = _slide_from_native(native)
+    assert pulled.template_name == "equation"
+    assert pulled.kicker == "THE OBJECTIVE"
+    assert pulled.equations == slide.equations
+    assert to_slidev(pulled) == to_slidev(slide)  # authored src verbatim
+
+
+def test_equation_template_content_lines_drop_the_unrendered_h1():
+    from slidesync._sync import _content_lines
+
+    src = _tpl_slide("objective").src
+    lines = _content_lines(src, "equation")
+    assert "THE OBJECTIVE" in lines
+    assert "A headline that must not render" not in lines
+    # A lone-kicker slide keeps its only heading (it renders as the kicker).
+    assert "JUST THE KICKER" in _content_lines(_tpl_slide("bare").src, "equation")

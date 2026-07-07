@@ -123,7 +123,14 @@ may have its own frontmatter (`id:`, `template:`, `layout:`, `hidden:`).
   round-trips: `pull` reads the live skipped state back to `hidden: true` (so a
   slide skipped natively in Slides comes back hidden too).
 - Bullets `-`/`*`; ordered `1.` (nest with 2-space indent). Inline
-  `**bold**` / `*italic*` / `` `code` `` / `[link](url)`. GFM tables.
+  `**bold**` / `*italic*` / `` `code` `` / `==highlight==` / `[link](url)`.
+  GFM tables.
+- **Highlight:** `==text==` (the markdown-it-mark dialect; delimiters must be
+  non-space-adjacent, so a bare `a == b` stays prose) renders as a warm amber
+  wash (`#FFE08A`) behind the run, with the text pinned to ink so the mark
+  stays legible on the dark templates too. Composes with the other inline
+  styles run-by-run, and round-trips: `pull` reads the background wash back to
+  `==text==` byte-identically.
   `![alt](path)` images (uploaded to Drive; `alt` becomes the accessibility
   description, round-tripped on pull). Blank lines preserved as spacing.
   `<!-- notes -->` become speaker notes — and round-trip as **comments, in
@@ -138,7 +145,8 @@ may have its own frontmatter (`id:`, `template:`, `layout:`, `hidden:`).
   (single- or multi-line; several per slide allowed) is rendered to a
   tight-bbox transparent PNG via matplotlib **mathtext** (no TeX install
   needed) and embedded as a centred image, sized above body text —
-  presentation-equation scale. Covers the common constructs (`\frac`,
+  presentation-equation scale (`template: equation` goes further: a full-slide
+  focal equation, rendered at double density so the blow-up stays crisp). Covers the common constructs (`\frac`,
   `\approx`, sub/superscripts, `\times`, `\max`, `\text{}`); a construct
   outside the mathtext subset logs a warning and skips that graphic. Renders
   are cached by source hash. The LaTeX source is part of the content hash
@@ -157,11 +165,19 @@ may have its own frontmatter (`id:`, `template:`, `layout:`, `hidden:`).
 ### Built-in brand kit (IBM Plex; red `#C0392B` kicker)
 
 Select per slide via `template:` — native styled boxes, no in-deck templates:
-`dark`/`title`, `appendix`, `question`/`label`, `topic`, `content`,
-`graph`/`full` (single full-bleed image), `prompt`/`code` (verbatim monospace).
-Title cards (`dark`/`title`/`appendix`) render body lines as a small dimmed
-**byline** beneath the headline (e.g. `Project · Presenter`) — they still have
-no linkable body region.
+
+| `template:` | Layout |
+|---|---|
+| `dark` / `title` | dark title card: centred kicker + 72pt headline; body lines render as a small dimmed **byline** (e.g. `Project · Presenter`) |
+| `appendix` | light title card (same shape as `dark`, paper background) |
+| `question` / `label` | red kicker + 50pt headline + centred body |
+| `topic` | one-line 40pt headline, left-aligned body |
+| `content` | the `##` kicker **is** the title (red, 18pt); left-aligned bullet body |
+| `equation` | focal `$$…$$` equation, centred and LARGE (scaled up to fill ~85% of the width, clamped to fit); one `##` red kicker on top; **`# h1` is parsed but not rendered** (like `graph` ignoring title/body — it still round-trips via the marker); body text renders as a short centred plain-text caption under the equation |
+| `graph` / `full` | single full-bleed image, no text |
+| `prompt` / `code` | verbatim monospace block at the largest size that fits |
+
+Title cards and `equation`/`graph`/`full` have no linkable body region.
 Slides with no `template:` fall back to a generative path (section /
 title+body / table / image) that also brands the background + IBM Plex.
 
