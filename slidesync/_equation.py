@@ -34,6 +34,9 @@ EQUATION_PT = 30
 # on-slide size either way — the render pt only sets pixel density, and the
 # larger render keeps the blown-up equation crisp.
 EQUATION_FOCUS_PT = 60
+# Computer Modern — the classic TeX serif math face — instead of matplotlib's
+# DejaVu Sans default, so slide equations read like paper typography.
+EQUATION_FONTSET = "cm"
 INK_HEX = "#1E2024"  # matches the deck's BODY_INK
 
 
@@ -42,11 +45,12 @@ def render_equation(source: str, color: str = INK_HEX,
     """Render LaTeX `source` to a cached transparent PNG, or `None` on failure.
 
     The PNG is written to `EQUATION_CACHE_DIR/<sha1>.png` (keyed on colour +
-    point size + source) and reused on the next call with the same inputs. Any
-    failure — matplotlib missing, or a construct outside the mathtext subset —
-    is logged as a warning and surfaced as `None`.
+    point size + fontset + source) and reused on the next call with the same
+    inputs. Any failure — matplotlib missing, or a construct outside the
+    mathtext subset — is logged as a warning and surfaced as `None`.
     """
-    digest = hashlib.sha1(f"{color}\n{pt}\n{source}".encode("utf-8")).hexdigest()
+    digest = hashlib.sha1(
+        f"{color}\n{pt}\n{EQUATION_FONTSET}\n{source}".encode("utf-8")).hexdigest()
     out = EQUATION_CACHE_DIR / f"{digest}.png"
     if out.exists():
         return out
@@ -77,10 +81,11 @@ def _render_mathtext(source: str, color: str, pt: int = EQUATION_PT) -> bytes | 
     tex = " ".join(source.split())
     fig = plt.figure(figsize=(0.01, 0.01))
     try:
-        fig.text(x=0, y=0, s=f"${tex}$", fontsize=pt, color=color)
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=EQUATION_DPI, transparent=True,
-                    bbox_inches="tight", pad_inches=0.02)
+        with matplotlib.rc_context({"mathtext.fontset": EQUATION_FONTSET}):
+            fig.text(x=0, y=0, s=f"${tex}$", fontsize=pt, color=color)
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=EQUATION_DPI, transparent=True,
+                        bbox_inches="tight", pad_inches=0.02)
         return buf.getvalue()
     except (ValueError, RuntimeError) as exc:  # mathtext parse errors -> ValueError
         logger.warning(f"mathtext failed to render '$${tex}$$': {exc}")
