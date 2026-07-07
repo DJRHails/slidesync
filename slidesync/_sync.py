@@ -57,6 +57,7 @@ import frontmatter
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
 from loguru import logger
 
@@ -1850,11 +1851,60 @@ def _resolve_image(drive, slide: Slide, base_dir=Path(".")):
 _BATCH_CHUNK = 500
 
 
+def _created_ids(chunk) -> list[str]:
+    """Explicit object ids a chunk brings into existence."""
+    ids = []
+    for req in chunk:
+        for kind, body in req.items():
+            if kind == "duplicateObject":
+                ids.append(body["objectIds"][body["objectId"]])
+            elif kind.startswith("create") and "objectId" in body:
+                ids.append(body["objectId"])
+    return ids
+
+
+def _live_ids(slides_api, deck) -> set[str]:
+    pres = slides_api.presentations().get(presentationId=deck).execute()
+    ids = set()
+    for page in pres.get("slides", []):
+        ids.add(page["objectId"])
+        for el in page.get("pageElements", []):
+            ids.add(el["objectId"])
+    return ids
+
+
+def _chunk_already_applied(slides_api, deck, chunk) -> bool:
+    """True when a rejected chunk's effects are already live — a replayed call.
+
+    httplib2 silently re-sends a request whose response was lost mid-read; the
+    replayed batchUpdate then rejects its own first create as a duplicate id
+    (or its first delete as not-found). Each call is atomic, so the whole
+    chunk either applied or it didn't: on a replay every created id is live
+    and every net-deleted id is gone; on a genuine bad request the rest of the
+    chunk's creates never happened.
+    """
+    created = _created_ids(chunk)
+    deleted = [r["deleteObject"]["objectId"] for r in chunk if "deleteObject" in r]
+    if not created and not deleted:
+        return False  # text-only chunks replay harmlessly; an error is genuine
+    live = _live_ids(slides_api, deck)
+    # A same-id refresh deletes then re-creates an id within one chunk; the
+    # re-create wins, so judge deletes only for ids the chunk doesn't recreate.
+    gone = set(deleted) - set(created)
+    return set(created) <= live and not (gone & live)
+
+
 def _batch(slides_api, deck, requests):
     for start in range(0, len(requests), _BATCH_CHUNK):
-        slides_api.presentations().batchUpdate(
-            presentationId=deck,
-            body={"requests": requests[start:start + _BATCH_CHUNK]}).execute()
+        chunk = requests[start:start + _BATCH_CHUNK]
+        try:
+            slides_api.presentations().batchUpdate(
+                presentationId=deck, body={"requests": chunk}).execute()
+        except HttpError:
+            if not _chunk_already_applied(slides_api, deck, chunk):
+                raise
+            logger.warning(f"batch chunk at request {start} had already applied "
+                           "(lost response replayed by the transport); continuing")
 
 
 def _apply_notes(slides_api, deck, creates):

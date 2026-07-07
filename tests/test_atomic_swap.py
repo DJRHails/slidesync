@@ -13,12 +13,13 @@ they pin the *ordering*, not just the final deck state. Reverting push to the ol
 delete-then-create order fails them (see the falsification notes per test).
 """
 
+import httplib2
 import pytest
 
 import test_e2e_scenarios as e2e
 
 from slidesync import _sync
-from slidesync._sync import _swap_requests, load_slides, push
+from slidesync._sync import HttpError, _swap_requests, load_slides, push
 
 DECK = "fakedeck"
 
@@ -437,6 +438,76 @@ def test_batch_small_request_list_stays_one_call():
     api = _ChunkRecorder()
     _sync._batch(api, DECK, [{"n": 0}, {"n": 1}])
     assert [len(c) for c in api.calls] == [2]
+
+
+class _ReplayFake:
+    """batchUpdate fake for the lost-response replay: the flagged call raises a
+    duplicate-id HttpError, and `presentations().get` reports `live` object ids
+    (what the deck looks like AFTER the phantom first application)."""
+
+    def __init__(self, live, fail_call=1):
+        self.live = live
+        self.fail_call = fail_call
+        self.applied = []
+        self._n = 0
+
+    def presentations(self):
+        return self
+
+    def get(self, presentationId):
+        self._result = {"slides": [{"objectId": oid, "pageElements": []}
+                                   for oid in self.live]}
+        return self
+
+    def batchUpdate(self, presentationId, body):
+        self._n += 1
+        if self._n - 1 == self.fail_call:
+            resp = httplib2.Response({"status": "400"})
+            return _FailingExec(HttpError(
+                resp, b'{"error": {"message": "The object ID (x) should be '
+                      b'unique among all pages and page elements."}}'))
+        self.applied.append(body["requests"])
+        self._result = {}
+        return self
+
+    def execute(self):
+        return self._result
+
+
+class _FailingExec:
+    def __init__(self, exc):
+        self.exc = exc
+
+    def execute(self):
+        raise self.exc
+
+
+def test_batch_replayed_chunk_is_detected_and_skipped(monkeypatch):
+    """A chunk whose response was lost gets re-sent by httplib2 and rejected as
+    a duplicate; when every id the chunk creates is already live, _batch must
+    treat it as applied and continue with the remaining chunks."""
+    monkeypatch.setattr(_sync, "_BATCH_CHUNK", 2)
+    reqs = [{"createSlide": {"objectId": "a"}},
+            {"createShape": {"objectId": "a_b"}},
+            {"createSlide": {"objectId": "c"}},
+            {"createShape": {"objectId": "c_b"}}]
+    api = _ReplayFake(live={"a", "a_b", "c", "c_b"}, fail_call=1)
+
+    _sync._batch(api, DECK, reqs)  # must not raise
+
+    assert api.applied == [reqs[:2]], "chunk 1 applied; the replayed chunk skipped"
+
+
+def test_batch_genuine_duplicate_still_raises(monkeypatch):
+    """Same rejection, but the chunk's OTHER created id is absent from the deck
+    — an atomically-rejected genuine bad request, which must propagate."""
+    monkeypatch.setattr(_sync, "_BATCH_CHUNK", 2)
+    reqs = [{"createSlide": {"objectId": "a"}},
+            {"createShape": {"objectId": "a_b"}}]
+    api = _ReplayFake(live={"a"}, fail_call=0)  # a_b never made it
+
+    with pytest.raises(HttpError):
+        _sync._batch(api, DECK, reqs)
 
 
 if __name__ == "__main__":
