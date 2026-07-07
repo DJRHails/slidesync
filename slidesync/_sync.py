@@ -2901,6 +2901,37 @@ def _styled_runs(paras: list[Para]) -> list[tuple]:
             for p in paras if p.text]
 
 
+def _wash_texts(paras: list[Para]) -> list[str]:
+    """Highlighted run texts, tightened to the ==mark== dialect (non-space-
+    adjacent delimiters)."""
+    return [t for p in paras for r in p.runs if r.style == "highlight"
+            if (t := p.text[r.start:r.end].strip())]
+
+
+def _capture_washes(text: str, sl, restyled) -> str | None:
+    """Wrap live-washed run texts as ==...== inside the slide's authored source.
+
+    The conservative style capture for a CLEAN slide: only washes new to the
+    live copy are written back, by exact-text substitution in the authored
+    block — never a body re-render, which would normalise away authored
+    formatting the read-back can't reproduce (comments, captions, fences).
+    Returns the updated file text, or None when nothing could be mapped.
+    """
+    if not sl.src or text.count(sl.src) != 1:
+        return None
+    have = set(_wash_texts(sl.paras))
+    src_new = sl.src
+    for t in _wash_texts(restyled.paras):
+        if t in have or f"=={t}==" in src_new:
+            continue
+        if t not in src_new:
+            logger.warning(f"[washed    ] {sl.key} — live highlight on {t!r} "
+                           "has no verbatim source text; add ==...== by hand")
+            continue
+        src_new = src_new.replace(t, f"=={t}==", 1)
+    return text.replace(sl.src, src_new, 1) if src_new != sl.src else None
+
+
 def _live_state(s) -> tuple[list[str], str, str | None, dict]:
     """(text lines, normalised notes, base source, marker) of a live slide."""
     notes_raw = _read_notes(s)
@@ -3137,20 +3168,36 @@ def cmd_sync(args):
         status = classify_drift(base, local, live_lines)
         if status in ("clean", "converged"):
             restyled = (_slide_from_live_boxes(s, marker, links)
-                        if rekeyed and marker.get("template") else None)
+                        if marker.get("template") else None)
             if restyled and _styled_runs(restyled.paras) != _styled_runs(sl.paras):
-                # Same text, different styling (e.g. highlights washed on in the
-                # Slides UI): text-line drift is blind to it, and the re-key
-                # push would recreate the slide without it — capture it first.
-                restyled.notes = " ".join(MARKER_RE.sub("", _read_notes(s)).split())
-                new = _replace_slide_body(texts[src_path], sl.src_key,
-                                          _render_body(restyled))
-                if new != texts[src_path]:
+                if rekeyed:
+                    # About to be recreated: write the full live styling back
+                    # first, or the re-key push would rebuild the slide bare.
+                    restyled.notes = " ".join(
+                        MARKER_RE.sub("", _read_notes(s)).split())
+                    new = _replace_slide_body(texts[src_path], sl.src_key,
+                                              _render_body(restyled))
+                    if new != texts[src_path]:
+                        texts[src_path] = new
+                        state["dirty"].add(src_path)
+                        logger.info(f"[restyled  ] {sl.key} — live styling "
+                                    f"captured -> {src_path.name}")
+                    continue
+                # Style-only drift on a clean slide: capture ONLY new washes
+                # (ANY background colour reads as ==highlight==, not just our
+                # amber — presenters pick theme colours) by wrapping the washed
+                # text in the authored source. A full body re-render here would
+                # normalise away authored formatting (comments, captions,
+                # fences) — the 32-slide churn of 2026-07-07.
+                new = _capture_washes(texts[src_path], sl, restyled)
+                if new is not None and new != texts[src_path]:
                     texts[src_path] = new
                     state["dirty"].add(src_path)
-                    logger.info(f"[restyled  ] {sl.key} — live styling captured "
-                                f"-> {src_path.name}")
-                continue
+                    state["pushable"] = True  # re-render in canonical amber now
+                    logger.info(f"[washed    ] {sl.key} — live highlight "
+                                f"captured -> {src_path.name}")
+                    continue
+                # other style-only drift (live bold/italic) stays uncaptured
             if s["objectId"] != sl.object_id:
                 # Rendered text matches, but the content hash moved — a
                 # comment/notes-level local change that still needs a push.

@@ -43,16 +43,22 @@ First result line.
 """
 
 
-def _text_els(text, mark=None):
+def _text_els(text, mark=None, links=None):
     """textElements for `text`; `mark` washes that substring with a background
-    colour — a styling-only live edit, like a presenter highlighting words."""
+    colour — a styling-only live edit, like a presenter highlighting words —
+    and `links` ({substring: link dict}) renders pushed link runs back, as the
+    real API does. At most one styled substring per line (all the tests need)."""
     els = []
     wash = {"backgroundColor": {"opaqueColor": {"rgbColor": {"red": 1.0}}}}
+    styled = {sub: {"link": link} for sub, link in (links or {}).items()}
+    if mark:
+        styled[mark] = wash
     for line in text.split("\n"):
         els.append({"paragraphMarker": {}})
-        if mark and mark in line:
-            pre, post = line.split(mark, 1)
-            for chunk, style in ((pre, {}), (mark, wash), (post + "\n", {})):
+        sub = next((s for s in styled if s in line), None)
+        if sub:
+            pre, post = line.split(sub, 1)
+            for chunk, style in ((pre, {}), (sub, styled[sub]), (post + "\n", {})):
                 if chunk:
                     els.append({"textRun": {"content": chunk, "style": style}})
         else:
@@ -114,7 +120,21 @@ class FakeStore:
                 up = r["updateSlideProperties"]
                 self._slide(up["objectId"])["skipped"] = \
                     up["slideProperties"].get("isSkipped", False)
-            # styling-only requests are ignored
+            elif "updateTextStyle" in r:
+                # Pushed ==highlight== washes and [text](#key) links must show
+                # back up in render() — the restyle-capture path compares live
+                # run styling against the source, so the fake has to reflect
+                # them as the real API does. Other styling is ignored.
+                up = r["updateTextStyle"]
+                style, rng = up.get("style", {}), up.get("textRange", {})
+                s = self._owner_of_shape(up["objectId"])
+                sh = s["shapes"].get(up["objectId"])
+                if sh and rng.get("type") == "FIXED_RANGE":
+                    run = sh["text"][rng["startIndex"]:rng["endIndex"]]
+                    if style.get("backgroundColor"):
+                        sh["mark"] = run
+                    elif style.get("link"):
+                        sh.setdefault("links", {})[run] = style["link"]
         return {}
 
     def render(self):
@@ -123,7 +143,8 @@ class FakeStore:
             els = [{"objectId": sid,
                     "transform": {"translateY": sh["y"], "translateX": sh["x"]},
                     "shape": {"text": {"textElements":
-                                       _text_els(sh["text"], sh.get("mark"))}}}
+                                       _text_els(sh["text"], sh.get("mark"),
+                                                 sh.get("links"))}}}
                    for sid, sh in s["shapes"].items() if sh["text"]]
             nid = s["id"] + "_n"
             out.append({
@@ -366,6 +387,22 @@ def test_sync_recaptures_orphaned_comment_via_key_hash(env):
     _push(env)  # re-render replaces the slide; the thread's page id now dangles
     _sync_cmd(env)
     assert "<!-- @Daniel Hails: anchored before the re-render -->" in env.path.read_text()
+
+
+def test_live_wash_on_a_clean_slide_is_captured_as_highlight(env):
+    """A presenter highlights words in the Slides UI and nothing else changes:
+    text-line drift reads the slide as clean, but the wash (ANY background
+    colour, not just slidesync's own amber — the fake washes with pure red)
+    must come back as ==...== and re-push in the canonical amber."""
+    env.store.mark_text("solid point")
+    _sync_cmd(env)
+    text = env.path.read_text()
+    assert "One ==solid point==." in text
+    # The same sync re-pushes the slide, so the canonical wash is already live.
+    marks = [sh.get("mark") for s in env.store.slides for sh in s["shapes"].values()]
+    assert "solid point" in marks
+    _sync_cmd(env)  # idempotent: the re-pushed amber wash matches the source
+    assert env.path.read_text().count("==solid point==") == 1
 
 
 GRAPH_MD = MD + """
