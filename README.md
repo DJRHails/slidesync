@@ -144,7 +144,9 @@ may have its own frontmatter (`id:`, `template:`, `layout:`, `hidden:`).
 - **Display equations:** a paragraph that is exactly a `$$...$$` block
   (single- or multi-line; several per slide allowed) is rendered to a
   tight-bbox transparent PNG via matplotlib **mathtext** (no TeX install
-  needed) and embedded as a centred image, sized above body text —
+  needed) in the Computer Modern fontset — the classic TeX serif math face,
+  so equations read like paper typography — and embedded as a centred image,
+  sized above body text —
   presentation-equation scale (`template: equation` goes further: a full-slide
   focal equation, rendered at double density so the blow-up stays crisp). Covers the common constructs (`\frac`,
   `\approx`, sub/superscripts, `\times`, `\max`, `\text{}`); a construct
