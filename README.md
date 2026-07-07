@@ -40,13 +40,13 @@ Support path.)
 
 | Command | Purpose |
 |---------|---------|
-| `slidesync push <file.slidev.md>... [--deck ID] [--new "Title"] [--anchor SLIDE] [--prune] [--force]` | markdown → Slides (rejected if it would discard live edits; `--force` overrides) |
+| `slidesync push <file.slidev.md>... [--deck ID] [--new "Title"] [--anchor SLIDE] [--prune] [--force] [--allow-rekey]` | markdown → Slides (rejected if it would discard live edits; `--force` overrides) |
 | `slidesync pull <deckId> --out <file.md> [--all]` | Slides → markdown (`--all` includes non-managed slides) |
 | `slidesync roundtrip [--keep]` | self-test: push a sample, pull, assert identical |
 | `slidesync layouts <deckId>` | list a deck's theme layouts + placeholders |
 | `slidesync make-templates <deckId>` | inject branded `{{token}}` template slides |
 | `slidesync comments <deckId>` | list comment threads as JSON (page anchor, author, content, replies) |
-| `slidesync sync <file.slidev.md>... [--deck ID] [--prune]` | reconcile with the live deck: pull comments + live edits into the markdown, push local changes; conflicts stop it (exit 1) |
+| `slidesync sync <file.slidev.md>... [--deck ID] [--prune] [--allow-rekey]` | reconcile with the live deck: pull comments + live edits into the markdown, push local changes; conflicts stop it (exit 1) |
 
 `push` resolves the target deck from (in order) `--deck`, `--new`, or a top-level
 `deck:` frontmatter key. Relative image paths resolve against each slide's own
@@ -86,6 +86,15 @@ path, template vars — and, for template slides, the authored body markdown
 markdown doesn't already carry that edit — the push is **rejected** with no
 changes made (`--force` overwrites). Live edits on slides the push wouldn't
 touch are left alone.
+
+**Mass re-key guard**: a push that would recreate a deck-scale number of slides
+under new ids — `max(10, 30% of managed slides)` created while at least as many
+live `s2g_` slides match no local slide — is refused outright, *even with
+`--force`* (an id-scheme change or key bug re-keys every slide; pushing that
+plan destroys live styling/edits on all the old copies). Capture the live deck
+first (`pull`/`sync` — `sync` matches re-keyed slides via their notes-marker id
+and writes live edits, including styling-only highlights, back into the
+markdown), then re-run with `--allow-rekey`.
 
 `sync` reconciles the two sides, applying whatever is safe. The marker's
 last-pushed source is a true per-slide **merge base**, so each slide classifies

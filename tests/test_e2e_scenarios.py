@@ -43,11 +43,20 @@ First result line.
 """
 
 
-def _text_els(text):
+def _text_els(text, mark=None):
+    """textElements for `text`; `mark` washes that substring with a background
+    colour — a styling-only live edit, like a presenter highlighting words."""
     els = []
+    wash = {"backgroundColor": {"opaqueColor": {"rgbColor": {"red": 1.0}}}}
     for line in text.split("\n"):
         els.append({"paragraphMarker": {}})
-        els.append({"textRun": {"content": line + "\n", "style": {}}})
+        if mark and mark in line:
+            pre, post = line.split(mark, 1)
+            for chunk, style in ((pre, {}), (mark, wash), (post + "\n", {})):
+                if chunk:
+                    els.append({"textRun": {"content": chunk, "style": style}})
+        else:
+            els.append({"textRun": {"content": line + "\n", "style": {}}})
     return els if text else []
 
 
@@ -113,7 +122,8 @@ class FakeStore:
         for s in self.slides:
             els = [{"objectId": sid,
                     "transform": {"translateY": sh["y"], "translateX": sh["x"]},
-                    "shape": {"text": {"textElements": _text_els(sh["text"])}}}
+                    "shape": {"text": {"textElements":
+                                       _text_els(sh["text"], sh.get("mark"))}}}
                    for sid, sh in s["shapes"].items() if sh["text"]]
             nid = s["id"] + "_n"
             out.append({
@@ -139,6 +149,15 @@ class FakeStore:
                     sh["text"] = sh["text"].replace(old, new)
                     return
         raise AssertionError(f"no live shape contains {old!r}")
+
+    def mark_text(self, needle):
+        """Wash `needle` with a background colour — text lines unchanged."""
+        for s in self.slides:
+            for sh in s["shapes"].values():
+                if needle in sh["text"]:
+                    sh["mark"] = needle
+                    return
+        raise AssertionError(f"no live shape contains {needle!r}")
 
     def all_text(self):
         return " ".join(sh["text"] for s in self.slides
@@ -246,7 +265,8 @@ def env(tmp_path, monkeypatch):
 
 
 def _sync_cmd(env):
-    cmd_sync(SimpleNamespace(source=env.path, deck=DECK, account=None, prune=False))
+    cmd_sync(SimpleNamespace(source=env.path, deck=DECK, account=None,
+                             prune=False, allow_rekey=False))
 
 
 def _push(env, force=False, prune=False):
@@ -372,7 +392,7 @@ def test_graph_slides_with_unrenderable_text_stay_clean(tmp_path, monkeypatch):
     push(slides_api, drive, DECK, load_slides(path), anchor=None, prune=False,
          base_dir=tmp_path)
     before = path.read_text()
-    cmd_sync(SimpleNamespace(source=path, deck=DECK, account=None, prune=False))
+    cmd_sync(SimpleNamespace(source=path, deck=DECK, account=None, prune=False, allow_rekey=False))
     assert path.read_text() == before  # no write-back, no conflict, no churn
 
 
@@ -412,7 +432,7 @@ def test_equation_slides_with_a_dropped_h1_stay_clean(tmp_path, monkeypatch):
     assert "THE OBJECTIVE" in live and "Maximise reward" in live
     assert "Headline parsed but never rendered" not in live
     before = path.read_text()
-    cmd_sync(SimpleNamespace(source=path, deck=DECK, account=None, prune=False))
+    cmd_sync(SimpleNamespace(source=path, deck=DECK, account=None, prune=False, allow_rekey=False))
     assert path.read_text() == before  # no write-back, no conflict, no churn
 
 
@@ -474,7 +494,7 @@ def multi(tmp_path, monkeypatch):
 
 def _multi_sync(env):
     cmd_sync(SimpleNamespace(source=[env.a, env.b], deck=DECK, account=None,
-                             prune=False))
+                             prune=False, allow_rekey=False))
 
 
 def test_multi_file_namespaces_ids_and_intra_file_links(multi):
@@ -618,3 +638,89 @@ def test_comment_only_local_change_still_syncs(env):
                  if any("Takeaway A" in sh["text"] for sh in s["shapes"].values()))
     assert "presenter note A" not in slide["notes"], \
         "the @-annotation must leave the speaker-notes pane on the next sync"
+
+
+# ---------------------------------------------------------------------------
+# Mass re-key guard: an id-scheme change (or key bug) must never silently
+# delete-and-recreate the whole live deck (the 0.10.2 incident: a routine sync
+# saw all 391 managed slides as missing and wiped live text highlights).
+# ---------------------------------------------------------------------------
+
+
+def _bulk_md(ids):
+    out = ["---\ntheme: seriph\n---\n"]
+    for i in ids:
+        out.append(f"---\ntemplate: content\nid: {i}\n---\n"
+                   f"## SLIDE {i}\n\nPoint {i}.\n")
+    return "\n".join(out)
+
+
+@pytest.fixture
+def bulk(tmp_path, monkeypatch):
+    """A deck big enough (12 slides) to clear the guard's 10-slide floor."""
+    store, drive = FakeStore(), FakeDrive()
+    slides_api = FakeSlides(store)
+    monkeypatch.setattr(_sync, "get_services", lambda account: (slides_api, drive))
+    path = tmp_path / "deck.slidev.md"
+    path.write_text(_bulk_md([f"s{i}" for i in range(12)]))
+    push(slides_api, drive, DECK, load_slides(path), anchor=None, prune=False,
+         base_dir=tmp_path)
+    return SimpleNamespace(store=store, drive=drive, slides=slides_api, path=path)
+
+
+def test_push_refuses_a_mass_rekey_even_with_force(bulk):
+    bulk.path.write_text(_bulk_md([f"renamed{i}" for i in range(12)]))
+    source = load_slides(bulk.path)
+    with pytest.raises(SystemExit, match="mass re-key detected"):
+        push(bulk.slides, bulk.drive, DECK, source, anchor=None, prune=True,
+             base_dir=bulk.path.parent)
+    with pytest.raises(SystemExit, match="mass re-key detected"):
+        push(bulk.slides, bulk.drive, DECK, source, anchor=None, prune=True,
+             base_dir=bulk.path.parent, force=True)
+    assert len(bulk.store.slides) == 12  # deck untouched by refused pushes
+    assert "Point s0." in bulk.store.all_text()
+
+
+def test_allow_rekey_lets_the_push_through(bulk):
+    bulk.path.write_text(_bulk_md([f"renamed{i}" for i in range(12)]))
+    stats = push(bulk.slides, bulk.drive, DECK, load_slides(bulk.path),
+                 anchor=None, prune=True, base_dir=bulk.path.parent,
+                 allow_rekey=True)
+    assert stats["create"] == 12 and stats["prune"] == 12
+    assert len(bulk.store.slides) == 12
+
+
+def test_sync_push_half_refuses_a_mass_rekey(bulk):
+    bulk.path.write_text(_bulk_md([f"renamed{i}" for i in range(12)]))
+    with pytest.raises(SystemExit, match="mass re-key detected"):
+        cmd_sync(SimpleNamespace(source=bulk.path, deck=DECK, account=None,
+                                 prune=True, allow_rekey=False))
+    assert len(bulk.store.slides) == 12  # deck untouched
+
+
+def test_normal_pushes_never_trip_the_guard(bulk):
+    # A few new slides + a content edit is everyday traffic, not a re-key.
+    ids = [f"s{i}" for i in range(12)] + ["brand-new"]
+    bulk.path.write_text(_bulk_md(ids).replace("Point s3.", "Point s3, updated."))
+    stats = push(bulk.slides, bulk.drive, DECK, load_slides(bulk.path),
+                 anchor=None, prune=False, base_dir=bulk.path.parent)
+    assert stats["create"] == 2 and stats["skip"] == 11
+
+
+def test_sync_captures_live_edits_across_a_hash_scheme_change(env, monkeypatch):
+    # Simulate an id-scheme change: same markdown, same human ids, but every
+    # key_hash moves. The notes-marker id must keep the live copies matched so
+    # BOTH kinds of live edit are captured before the deck is recreated:
+    # a text edit (drift) and a styling-only highlight (invisible to text
+    # lines). 2 managed slides is far below the guard threshold, so the
+    # follow-up push runs without --allow-rekey.
+    _live_edit(env)                          # text edit on one live slide
+    env.store.mark_text("First result")      # highlight wash on the other
+    orig_sha10 = _sync._sha10
+    monkeypatch.setattr(_sync, "_sha10", lambda text: orig_sha10(f"v2|{text}"))
+    _sync_cmd(env)
+    text = env.path.read_text()
+    assert "live-edited" in text, "text drift must be captured across a re-key"
+    assert "==First result==" in text, \
+        "styling-only live edits must be captured across a re-key"
+    assert "live-edited" in env.store.all_text()

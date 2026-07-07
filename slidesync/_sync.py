@@ -25,6 +25,16 @@ Idempotent sync (upsert), never a blind append:
   carries the human id + image path — and, for template slides, the authored
   body markdown (base64) — so `pull` recovers the source verbatim: comments
   stay comments, in place, instead of collapsing into one speaker-notes blob.
+- ID-SCHEME STABILITY: the `s2g_<keyHash>_<contentHash>` format and every input
+  to `keyHash` (digest, hash length, key derivation, multi-file namespacing)
+  are a compatibility contract with every existing deck. Changing any of them
+  re-keys every live slide: a routine push then sees a brand-new deck, recreates
+  all slides from markdown, and destroys live styling/edits on the old copies.
+  Any scheme change MUST ship a migration path — match old-scheme ids on read
+  (the notes-marker `id` is the scheme-independent handle `sync` already uses)
+  — and a CHANGELOG note. `mass_rekey` is the backstop: a push that would
+  recreate a deck-scale number of slides under new ids is refused without
+  `--allow-rekey`.
 
 Usage:
     bin/slidesync.py push deck.slidev.md --deck <id> [--anchor <slideId>] [--prune]
@@ -460,6 +470,10 @@ def build_slide(meta: dict, body: str, index: int) -> Slide:
 
 
 def _finalize(slide: Slide, base_dir: Path = Path(".")) -> Slide:
+    # The objectId scheme below is a compatibility contract with every existing
+    # deck — changing it re-keys every live slide (see ID-SCHEME STABILITY in
+    # the module docstring). Any change needs a read-side migration path, not
+    # just a version bump.
     canonical = to_slidev(slide, include_id=False)
     img_hash = _image_bytes_hash(slide, base_dir)
     if img_hash is not None:  # fold the image bytes in so regenerated pixels re-push
@@ -1583,6 +1597,46 @@ def plan_sync(source: list[Slide], managed: dict, prune: bool, force: bool = Fal
     return creates, deletes, skips, pruned
 
 
+# Mass re-key guard: floor and deck-fraction for refusing a push that would
+# recreate the deck wholesale under new ids (see mass_rekey). The threshold is
+# max(floor, fraction * managed), so small decks (< REKEY_MIN_SLIDES managed
+# slides) never trip it and big decks need a deck-scale volume of re-keyed
+# slides, not just a handful of stale ones.
+REKEY_MIN_SLIDES = 10
+REKEY_MANAGED_FRACTION = 0.30
+
+
+def mass_rekey(source: list[Slide], managed: dict) -> tuple[int, int] | None:
+    """Detect a plan that would recreate the deck wholesale under new objectIds.
+
+    When the objectId/keyHash scheme changes (or a bug perturbs key
+    computation), every local slide suddenly matches no live slide: the plan
+    sees a brand-new deck to create, while every existing `s2g_` slide on the
+    deck matches no local key. Pushing that plan recreates all slides from
+    markdown, so live styling/edits on the old copies are lost (`--prune`
+    deletes them outright; without it they linger as duplicates). This
+    happened on the 0.10.2 upgrade: a routine sync saw all 391 managed slides
+    as missing, recreated them, and wiped live text highlights applied minutes
+    earlier.
+
+    Returns (new_key_creates, unmatched_live) when BOTH counts reach
+    max(REKEY_MIN_SLIDES, REKEY_MANAGED_FRACTION * len(managed)) — the caller
+    refuses unless --allow-rekey — else None. A normal push never triggers: a
+    few new slides leave unmatched_live near zero, and mass *content* edits
+    keep every key_hash matched, so new_key_creates stays near zero.
+    """
+    if not managed:
+        return None  # brand-new/empty deck: nothing live to lose
+    local_khs = {s.key_hash for s in source}
+    new_key_creates = sum(1 for s in source if s.key_hash not in managed)
+    unmatched_live = sum(1 for kh in managed if kh not in local_khs)
+    threshold = max(REKEY_MIN_SLIDES,
+                    math.ceil(REKEY_MANAGED_FRACTION * len(managed)))
+    if new_key_creates >= threshold and unmatched_live >= threshold:
+        return new_key_creates, unmatched_live
+    return None
+
+
 def _swap_requests(new_reqs: list[dict], new_id: str, old_id: str,
                    old_index: int) -> list[dict]:
     """Blue-green swap for one replaced slide, as a single ordered run.
@@ -1617,12 +1671,23 @@ def _swap_requests(new_reqs: list[dict], new_id: str, old_id: str,
 
 
 def push(slides_api, drive, deck, source, anchor, prune, base_dir=Path("."),
-         force=False) -> dict:
+         force=False, allow_rekey=False) -> dict:
     pres = slides_api.presentations().get(presentationId=deck).execute()
     managed = managed_slides(slides_api, deck, pres)
     creates, deletes, skips, pruned = plan_sync(source, managed, prune, force)
     if not (creates or deletes or pruned):  # nothing changed — skip reorder/links/gets
         return {"create": 0, "skip": len(skips), "replace": 0, "prune": 0}
+    rekey = mass_rekey(source, managed)
+    if rekey and not allow_rekey:
+        # Deliberately NOT bypassed by --force: force answers "overwrite live
+        # edits on slides I still match"; a mass re-key means matching itself
+        # broke, and force-retry loops are exactly how the wipe happens.
+        new_keys, orphaned = rekey
+        sys.exit(f"push rejected: mass re-key detected — {new_keys} slides would "
+                 f"be recreated under new ids while {orphaned} live s2g slides "
+                 "match no local slide; live edits/styling on the old copies "
+                 "would be lost. Run `slidesync pull`/`slidesync sync` to capture "
+                 "the live deck first, then re-push with --allow-rekey.")
     if not force:
         # Non-fast-forward guard: replacing or pruning a slide that was edited
         # in Google Slides since its last push would silently discard that edit.
@@ -2660,7 +2725,8 @@ def cmd_push(args):
     if not deck:
         sys.exit("no target deck: pass --deck/--new or add `deck:` frontmatter")
     stats = push(slides_api, drive, deck, source, args.anchor, args.prune,
-                 base_dir=paths[0].parent, force=args.force)
+                 base_dir=paths[0].parent, force=args.force,
+                 allow_rekey=args.allow_rekey)
     logger.success(f"{stats} -> https://docs.google.com/presentation/d/{deck}/edit")
 
 
@@ -2823,6 +2889,15 @@ def _content_lines(src: str | None, template: str | None) -> list[str] | None:
     return lines
 
 
+def _styled_runs(paras: list[Para]) -> list[tuple]:
+    """(text, run signature) per non-blank para — the styling layer that
+    text-line drift comparison is blind to. A live highlight/bold applied in
+    the Slides UI changes runs but not text, so `classify_drift` reads the
+    slide as clean; comparing these signatures catches it."""
+    return [(p.text, tuple((r.start, r.end, r.style, r.link) for r in p.runs))
+            for p in paras if p.text]
+
+
 def _live_state(s) -> tuple[list[str], str, str | None, dict]:
     """(text lines, normalised notes, base source, marker) of a live slide."""
     notes_raw = _read_notes(s)
@@ -2842,6 +2917,7 @@ def _clobber_risks(pres, managed, source, pruned) -> list[str]:
     """
     live = {s["objectId"]: s for s in pres.get("slides", [])}
     by_kh = {s.key_hash: s for s in source}
+    by_key = {s.key: s for s in source}
     out = []
     for kh, (oid, _ch) in managed.items():
         sl = by_kh.get(kh)
@@ -2849,6 +2925,11 @@ def _clobber_risks(pres, managed, source, pruned) -> list[str]:
         if not (replacing or oid in pruned) or live.get(oid) is None:
             continue
         live_lines, live_notes, base_src, marker = _live_state(live[oid])
+        if sl is None:
+            # Re-key: the hash no longer matches, but the notes marker carries
+            # the human id — so a live edit that `sync` already captured into
+            # the markdown is still recognised as carried, not clobbered.
+            sl = by_key.get(marker.get("id", ""))
         if base_src is None:
             continue
         if (live_lines == _content_lines(base_src, marker.get("template"))
@@ -2953,6 +3034,12 @@ def cmd_sync(args):
     Push side: when no conflicts remain, the (updated) file is pushed — safe,
     because local now matches live wherever the deck had drifted. Exits 1 when
     conflicts remain.
+
+    Re-keyed decks (an id-scheme change orphaning every hash-derived objectId)
+    are still matched through the notes-marker human id, so the capture pass —
+    including styling-only live edits the text-line drift check can't see —
+    writes back BEFORE the re-key push, which itself stays refused at deck
+    scale without --allow-rekey (see mass_rekey).
     """
     slides_api, drive = get_services(args.account)
     paths = _source_paths(args)
@@ -2974,6 +3061,15 @@ def cmd_sync(args):
     origin_by_kh: dict[str, tuple[Path, str]] = {
         sl.key_hash: (sl.src_path, sl.src_key)
         for sl in source if sl.src_path is not None}  # src_path always set by load_deck
+    # Re-key fallback index: the notes marker carries each slide's human id
+    # verbatim, so live copies stay matchable even when the objectId/keyHash
+    # scheme changes and the hash-keyed `live` lookup goes dark (the mass
+    # re-key case — see mass_rekey). Maps marker id -> live key_hash.
+    marker_kh: dict[str, str] = {}
+    for kh, s in live.items():
+        mid = _read_marker(_read_notes(s)).get("id")
+        if mid:
+            marker_kh.setdefault(mid, kh)
 
     def capture(origin: tuple[Path, str] | None, c: dict, page: str) -> None:
         lines = [f"@{c['author']}: {c['content']}"]
@@ -3001,6 +3097,17 @@ def cmd_sync(args):
         src_path = sl.src_path
         origin = (src_path, sl.src_key)
         s = live.pop(sl.key_hash, None)
+        rekeyed = False
+        if s is None and (old_kh := marker_kh.get(sl.key)) in live:
+            # Old-scheme live copy: same human id, different key_hash. Matching
+            # it keeps the capture/drift machinery working across a re-key, so
+            # live edits are written back BEFORE any re-key push recreates the
+            # slide (the push itself still needs --allow-rekey at deck scale).
+            s = live.pop(old_kh)
+            rekeyed = True
+            state["pushable"] = True  # the id must migrate even if content matches
+            logger.info(f"[re-keyed  ] {sl.key} — matched live copy "
+                        f"{s['objectId']} via its notes-marker id")
         if s is None:
             logger.info(f"[missing   ] {sl.key} — push will create it")
             state["pushable"] = True
@@ -3026,6 +3133,21 @@ def cmd_sync(args):
         local = _content_lines(sl.src or "", sl.template_name) or []
         status = classify_drift(base, local, live_lines)
         if status in ("clean", "converged"):
+            restyled = (_slide_from_live_boxes(s, marker, links)
+                        if rekeyed and marker.get("template") else None)
+            if restyled and _styled_runs(restyled.paras) != _styled_runs(sl.paras):
+                # Same text, different styling (e.g. highlights washed on in the
+                # Slides UI): text-line drift is blind to it, and the re-key
+                # push would recreate the slide without it — capture it first.
+                restyled.notes = " ".join(MARKER_RE.sub("", _read_notes(s)).split())
+                new = _replace_slide_body(texts[src_path], sl.src_key,
+                                          _render_body(restyled))
+                if new != texts[src_path]:
+                    texts[src_path] = new
+                    state["dirty"].add(src_path)
+                    logger.info(f"[restyled  ] {sl.key} — live styling captured "
+                                f"-> {src_path.name}")
+                continue
             if s["objectId"] != sl.object_id:
                 # Rendered text matches, but the content hash moved — a
                 # comment/notes-level local change that still needs a push.
@@ -3073,7 +3195,8 @@ def cmd_sync(args):
                  "the markdown, then `slidesync push` (its guard protects the rest).")
     if state["pushable"]:
         stats = push(slides_api, drive, deck, load_deck(paths), anchor=None,
-                     prune=args.prune, base_dir=paths[0].parent)
+                     prune=args.prune, base_dir=paths[0].parent,
+                     allow_rekey=args.allow_rekey)
         logger.success(f"{stats} -> "
                        f"https://docs.google.com/presentation/d/{deck}/edit")
     else:
@@ -3143,6 +3266,11 @@ def main():
     p.add_argument("--prune", action="store_true")
     p.add_argument("--force", action="store_true",
                    help="re-render all slides, ignoring the skip optimisation")
+    p.add_argument("--allow-rekey", action="store_true",
+                   help="permit a push that recreates a deck-scale number of "
+                        "slides under new ids (normally refused, even with "
+                        "--force: live edits/styling on the old copies would "
+                        "be lost — capture with pull/sync first)")
     p.set_defaults(func=cmd_push)
 
     p = sub.add_parser("pull")
@@ -3171,6 +3299,10 @@ def main():
     p.add_argument("--deck")
     p.add_argument("--prune", action="store_true",
                    help="the final push deletes managed slides missing from the sources")
+    p.add_argument("--allow-rekey", action="store_true",
+                   help="permit the push half to recreate a deck-scale number "
+                        "of slides under new ids (sync's capture pass has "
+                        "already written live edits/styling back by then)")
     p.set_defaults(func=cmd_sync)
 
     p = sub.add_parser("make-templates",

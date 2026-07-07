@@ -186,7 +186,7 @@ def test_full_sync_no_op_preserves_intra_deck_link(tmp_path, monkeypatch):
 
     def sync():
         cmd_sync(SimpleNamespace(source=path, deck="fakedeck", account=None,
-                                 prune=False))
+                                 prune=False, allow_rekey=False))
 
     sync()
     after_first = path.read_text()
