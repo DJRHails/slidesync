@@ -1858,7 +1858,10 @@ def _created_ids(chunk) -> list[str]:
         for kind, body in req.items():
             if kind == "duplicateObject":
                 ids.append(body["objectIds"][body["objectId"]])
-            elif kind.startswith("create") and "objectId" in body:
+            elif (kind.startswith("create") and "objectId" in body
+                  and kind != "createParagraphBullets"):
+                # createParagraphBullets is the one create* request whose
+                # objectId is an existing element, not a new object.
                 ids.append(body["objectId"])
     return ids
 
