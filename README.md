@@ -134,6 +134,17 @@ may have its own frontmatter (`id:`, `template:`, `layout:`, `hidden:`).
 - **Internal links:** `[text](#slide-id)` becomes a native Slides link to the
   slide whose `id:` (or title slug) is `slide-id`, and round-trips: `pull` reads
   the native page-link back to `[text](#slide-id)` (so it no longer churns).
+- **Display equations:** a paragraph that is exactly a `$$...$$` block
+  (single- or multi-line; several per slide allowed) is rendered to a
+  tight-bbox transparent PNG via matplotlib **mathtext** (no TeX install
+  needed) and embedded as a centred image, sized above body text —
+  presentation-equation scale. Covers the common constructs (`\frac`,
+  `\approx`, sub/superscripts, `\times`, `\max`, `\text{}`); a construct
+  outside the mathtext subset logs a warning and skips that graphic. Renders
+  are cached by source hash. The LaTeX source is part of the content hash
+  (editing an equation re-pushes the slide) and is stashed verbatim in the
+  hidden notes marker, so `pull` reconstructs the original `$$...$$` block
+  byte-identically. Inline `$x$` maths is out of scope.
 - **Mermaid diagrams:** a fenced ```` ```mermaid ```` block is rendered to a PNG
   and embedded as an image (Slides has no native Mermaid renderer). Renders are
   cached by diagram hash, so an unchanged diagram is never re-rendered or

@@ -60,6 +60,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from loguru import logger
 
+from slidesync._equation import EQUATION_DPI, INK_HEX, render_equation
 from slidesync._mermaid import render_mermaid
 
 # gog's OAuth client file — Linux/XDG (`~/.config/gogcli`) or macOS App Support;
@@ -84,6 +85,7 @@ DEFAULT_ACCOUNT = None  # resolved from gog (or $SLIDESYNC_ACCOUNT)
 IMAGE_CACHE = Path(".data/cache/slidesync_images.json")
 
 MANAGED_RE = re.compile(r"^s2g_[0-9a-f]{10}_[0-9a-f]{10}$")
+_EQ_IMG_RE = re.compile(r"_eq\d+$")  # element id of a rendered $$-equation image
 MARKER_RE = re.compile(r"<!--\s*s2g\s*(?P<json>\{.*?\})\s*-->", re.S)
 TEMPLATE_TAG_RE = re.compile(r"<!--\s*s2g:template\s+(?P<name>\S+)\s*-->")
 EMU_PER_PX = 9525  # 96 dpi
@@ -212,6 +214,7 @@ class Slide:
     mermaid: str | None = None  # ```mermaid``` source, rendered to a PNG on push
     table: list[list[str]] | None = None
     notes: str = ""
+    equations: list[str] = field(default_factory=list)  # $$...$$ LaTeX, PNG on push
     kicker: str = ""  # h2 above an h1 -> {{h2}} kicker
     layout_name: str | None = None  # explicit `layout:` — section kw or theme layout
     template_name: str | None = None  # explicit `template:` — tagged styled slide
@@ -234,7 +237,7 @@ class Slide:
         return (self.key, self.layout_name, self.template_name,
                 tuple(sorted(self.vars.items())), self.layout, self.title,
                 self.kicker, paras, table, self.image, self.image_alt,
-                self.notes, self.hidden)
+                self.notes, self.hidden, tuple(self.equations))
 
 
 def _u16(text: str) -> int:
@@ -303,6 +306,13 @@ MERMAID_RE = re.compile(
     ^```\ *mermaid\ *\n     # fence opening with a mermaid lang tag
     (?P<diagram>.*?)        # the diagram source (rendered to a PNG on push)
     \n```\ *$               # fence close
+    """
+)
+EQUATION_RE = re.compile(
+    r"""(?msx)              # multiline, dotall, verbose
+    ^\$\$                   # display-math opener at line start
+    (?P<tex>.+?)            # the LaTeX source (single- or multi-line)
+    \$\$[ \t]*$             # closer ending a line
     """
 )
 TABLE_SEP_RE = re.compile(r"^\s*\|?[\s:|-]+\|?\s*$")
@@ -416,13 +426,13 @@ def build_slide(meta: dict, body: str, index: int) -> Slide:
     verbatim = None
     if (meta.get("template") or "").lower() in ("prompt", "code"):
         verbatim, body = _extract_verbatim(body)
-    headings, paras, image, image_alt, mermaid, table, notes = parse_body(body)
+    headings, paras, image, image_alt, mermaid, table, notes, equations = parse_body(body)
     h1, h2 = headings.get(1), headings.get(2)
     title = h1 or h2 or ""           # h1 is the headline; a lone h2 is the title
     kicker = h2 if (h1 and h2) else ""  # an h2 above an h1 is the kicker
     key = meta.get("id") or _slug(title) or f"slide{index}"
     slide = Slide(key, _layout_of(meta, image or mermaid, table), title, paras,
-                  image, image_alt, mermaid, table, notes)
+                  image, image_alt, mermaid, table, notes, equations)
     slide.kicker = kicker
     slide.layout_name = meta.get("layout")
     slide.template_name = "custom" if custom is not None else meta.get("template")
@@ -462,10 +472,12 @@ def _layout_of(meta: dict, image, table) -> str:
 
 
 def parse_body(body: str):
-    """Return (headings{level:text}, paras, image, image_alt, mermaid, table, notes)."""
+    """Return (headings{level:text}, paras, image, image_alt, mermaid, table,
+    notes, equations)."""
     notes = _extract_notes(body)
     body = COMMENT_RE.sub("", body)
     mermaid, body = _extract_mermaid(body)
+    equations, body = _extract_equations(body)
     body = VCLICK_RE.sub("", DIV_RE.sub("", body))
     lines = body.splitlines()
     headings, paras, image, table, image_alt = {}, [], None, None, ""
@@ -492,7 +504,7 @@ def parse_body(body: str):
     while paras and not paras[-1].text and paras[-1].depth < 0 \
             and not paras[-1].runs:
         paras.pop()
-    return headings, paras, image, image_alt, mermaid, table, notes
+    return headings, paras, image, image_alt, mermaid, table, notes, equations
 
 
 def _is_thread(comment_body: str) -> bool:
@@ -553,6 +565,18 @@ def _extract_mermaid(body: str) -> tuple[str | None, str]:
     if not m:
         return None, body
     return m.group("diagram").strip(), body[:m.start()] + body[m.end():]
+
+
+def _extract_equations(body: str) -> tuple[list[str], str]:
+    """Pull every display-math `$$...$$` paragraph out of the body.
+
+    Each is rendered to a transparent PNG on push. The inner LaTeX is kept
+    verbatim (including internal newlines) so `to_slidev` can re-emit the block
+    byte-identically. Inline `$x$` maths is out of scope and passes through as
+    plain text.
+    """
+    eqs = [m.group("tex") for m in EQUATION_RE.finditer(body)]
+    return (eqs, EQUATION_RE.sub("", body)) if eqs else (eqs, body)
 
 
 VERBATIM_RE = re.compile(  # any fenced block — captures the literal body, no parsing
@@ -685,6 +709,9 @@ def to_slidev(slide: Slide, include_id: bool = True) -> str:
     elif slide.title:
         out.append(("# " if slide.layout == "section" else "## ") + slide.title)
     out += [_render_para(p) for p in slide.paras]
+    # the stored LaTeX is verbatim (delimiters stripped at parse time), so the
+    # re-emitted block is byte-identical to what was authored
+    out += [f"$${eq}$$" for eq in slide.equations]
     if slide.image:
         out.append(f"![{slide.image_alt}]({slide.image})")
     if slide.table:
@@ -740,6 +767,12 @@ def _marker(slide: Slide) -> str:
         data["img"] = slide.image
         if slide.image_alt:
             data["alt"] = slide.image_alt
+    if slide.equations:
+        # base64 like `src` below: LaTeX braces mean a `}` could land right
+        # before `-->` and truncate the delimiter-based MARKER_RE JSON. This is
+        # what lets `pull` reconstruct the `$$...$$` source verbatim.
+        data["eq"] = [base64.b64encode(e.encode()).decode()
+                      for e in slide.equations]
     if slide.template_name:
         data["template"] = slide.template_name
         if slide.title:
@@ -891,7 +924,58 @@ def _fit_paras_pt(paras: list[Para], base: int = BODY_PT, floor: int = 12,
     return floor
 
 
-def _styled_requests(slide: Slide, style: Style, image_url, image_px) -> list[dict]:
+EQ_GAP_IN = 0.15  # vertical gap between stacked display equations
+
+
+def _eq_sizes_in(equations) -> list[tuple[float, float]]:
+    """Natural (w, h) inches of each rendered equation at its render DPI."""
+    return [(px[0] / EQUATION_DPI, px[1] / EQUATION_DPI) if px else (3.0, 0.8)
+            for _src, _url, px in equations]
+
+
+def _eq_stack_h(sizes: list[tuple[float, float]], width_in: float = 9.32) -> float:
+    """Height (inches) of the equation stack after the per-equation width clamp."""
+    if not sizes:
+        return 0.0
+    heights = [h * min(1.0, width_in / w) for w, h in sizes]
+    return sum(heights) + EQ_GAP_IN * (len(heights) - 1)
+
+
+def _equation_requests(sid: str, equations, top_in: float, bottom_in: float,
+                       x_in: float = 0.34, width_in: float = 9.32) -> list[dict]:
+    """createImage requests for a slide's `$$...$$` display-equation stack.
+
+    Each equation is placed at its natural rendered size (EQUATION_PT at
+    EQUATION_DPI — presentation-equation scale, larger than body text), clamped
+    to the region's width; the whole stack shrinks uniformly if it overflows
+    [top_in, bottom_in]. Centred horizontally, and vertically within the region.
+    The LaTeX source doubles as the image's accessibility description.
+    """
+    clamped = [(w * min(1.0, width_in / w), h * min(1.0, width_in / w))
+               for w, h in _eq_sizes_in(equations)]
+    total = sum(h for _, h in clamped) + EQ_GAP_IN * (len(clamped) - 1)
+    avail = max(bottom_in - top_in, 0.5)
+    scale = min(1.0, avail / total) if total > 0 else 1.0
+    y = top_in + max(0.0, (avail - total * scale) / 2)
+    reqs = []
+    for i, ((w, h), (src, url, _px)) in enumerate(zip(clamped, equations)):
+        w, h = w * scale, h * scale
+        eq_id = f"{sid}_eq{i}"
+        reqs.append({"createImage": {
+            "objectId": eq_id, "url": url,
+            "elementProperties": {"pageObjectId": sid,
+                "size": {"width": {"magnitude": _emu(w), "unit": "EMU"},
+                         "height": {"magnitude": _emu(h), "unit": "EMU"}},
+                "transform": {"scaleX": 1, "scaleY": 1, "unit": "EMU",
+                              "translateX": _emu(x_in + (width_in - w) / 2),
+                              "translateY": _emu(y)}}}})
+        reqs.append(_alt_req(eq_id, f"$${' '.join(src.split())}$$"))
+        y += h + EQ_GAP_IN * scale
+    return reqs
+
+
+def _styled_requests(slide: Slide, style: Style, image_url, image_px,
+                     equations=()) -> list[dict]:
     sid = slide.object_id
     reqs = [{"createSlide": {"objectId": sid,
                              "slideLayoutReference": {"predefinedLayout": "BLANK"}}},
@@ -936,9 +1020,14 @@ def _styled_requests(slide: Slide, style: Style, image_url, image_px) -> list[di
         reqs += _text_box(sid, sid + "_by", (0.34, y, 9.32, by_h),
                           byline, 14, rgb, False)
         y += by_h + 0.1
+    eq_top = None  # top of the display-equation stack, when one renders
     if style.body_align and slide.paras:
         bid = sid + "_b"
-        box_h = max(5.2 - y, 1.0)
+        # reserve the equation stack's natural height at the bottom of the
+        # body region; the body text auto-fits into what remains
+        eq_h = _eq_stack_h(_eq_sizes_in(equations))
+        box_h = max(5.2 - y - (eq_h + 0.1 if equations else 0.0), 1.0)
+        eq_top = y + box_h + 0.1
         reqs.append({"createShape": {"objectId": bid, "shapeType": "TEXT_BOX",
             "elementProperties": {"pageObjectId": sid,
                 "size": {"width": {"magnitude": _emu(9.32), "unit": "EMU"},
@@ -954,6 +1043,10 @@ def _styled_requests(slide: Slide, style: Style, image_url, image_px) -> list[di
             logger.warning(f"slide '{slide.key}': body auto-shrunk "
                            f"{BODY_PT}->{body_pt}pt to fit")
         reqs += _body(bid, slide.paras, align=style.body_align, size=body_pt)
+    elif equations:
+        eq_top = y  # no body text: centre the stack in the remaining region
+    if equations and eq_top is not None:
+        reqs += _equation_requests(sid, equations, top_in=eq_top, bottom_in=5.35)
     if slide.image and image_url:
         avail = _emu(max(5.4 - y, 1.5))
         w, h = _fit2(image_px, _emu(9.32), avail)
@@ -1080,21 +1173,33 @@ def _prompt_requests(slide: Slide) -> list[dict]:
     return reqs
 
 
+def _warn_dropped_equations(slide: Slide, where: str) -> None:
+    if slide.equations:
+        logger.warning(f"$$...$$ equations on '{slide.key}' ignored: "
+                       f"{where} slides have no equation region")
+
+
 def slide_requests(slide: Slide, image_url, image_px,
-                   layouts=None, templates=None) -> list[dict]:
+                   layouts=None, templates=None, equations=()) -> list[dict]:
     if slide.custom is not None:
+        _warn_dropped_equations(slide, "custom (```gslides```)")
         return _custom_requests(slide)
     tpl = (slide.template_name or "").lower()
     if tpl in ("graph", "full"):
+        _warn_dropped_equations(slide, "graph/full")
         return _graph_requests(slide, image_url, image_px)
     if tpl in ("prompt", "code"):
+        _warn_dropped_equations(slide, "prompt/code")
         return _prompt_requests(slide)
     if tpl in STYLES:
-        return _styled_requests(slide, STYLES[tpl], image_url, image_px)
+        return _styled_requests(slide, STYLES[tpl], image_url, image_px,
+                                equations=equations)
     if templates and tpl in templates:
+        _warn_dropped_equations(slide, "tagged-template")
         return _tagged_requests(slide, templates[tpl])
     name = (slide.layout_name or "").lower()
     if layouts and name in layouts and slide.layout_name not in SECTION_LAYOUTS:
+        _warn_dropped_equations(slide, "themed-layout")
         return _layout_requests(slide, layouts[name])
     tid = slide.object_id + "_t"
     if slide.layout == "section":
@@ -1116,6 +1221,13 @@ def slide_requests(slide: Slide, image_url, image_px,
                 reqs.append(_alt_req(slide.object_id + "_img", slide.image_alt))
         elif slide.layout == "table" and slide.table:
             reqs += _table(slide)
+    if equations:
+        body_x, body_w = BODY_X / EMU_PER_IN, BODY_W / EMU_PER_IN
+        top, bottom = BODY_Y / EMU_PER_IN, (BODY_Y + BODY_H) / EMU_PER_IN
+        if slide.paras:  # text above: anchor the stack to the region's bottom
+            top = bottom - _eq_stack_h(_eq_sizes_in(equations), width_in=body_w)
+        reqs += _equation_requests(slide.object_id, equations, top_in=top,
+                                   bottom_in=bottom, x_in=body_x, width_in=body_w)
     return reqs
 
 
@@ -1437,7 +1549,8 @@ def push(slides_api, drive, deck, source, anchor, prune, base_dir=Path("."),
 
     def build(slide: Slide) -> list[dict]:
         url, px = _resolve_image(drive, slide, base_dir)
-        return slide_requests(slide, url, px, layouts, templates)
+        return slide_requests(slide, url, px, layouts, templates,
+                              equations=_resolve_equations(drive, slide))
 
     # Order within the single batch: blue-green swaps FIRST (each position-
     # preserving, so every old index stays valid across the run), then plain
@@ -1582,6 +1695,29 @@ def _image_path(slide: Slide, base_dir: Path = Path(".")) -> Path | None:
     if p.is_absolute():
         return p
     return (slide.src_path.parent if slide.src_path else base_dir) / p
+
+
+def _equation_ink(slide: Slide) -> str:
+    """Hex colour for a slide's rendered equations — paper on dark templates."""
+    style = STYLES.get((slide.template_name or "").lower())
+    if style is not None and style.bg == DARK_BG:
+        return "#FAFAFA"
+    return INK_HEX
+
+
+def _resolve_equations(drive, slide: Slide) -> list[tuple[str, str, tuple]]:
+    """Render + upload a slide's `$$...$$` blocks -> [(source, url, (w, h) px)].
+
+    A render failure (construct outside the mathtext subset) is warned about in
+    `render_equation` and that equation is skipped, not the whole push.
+    """
+    out = []
+    for src in slide.equations:
+        png = render_equation(src, color=_equation_ink(slide))
+        if png is None:
+            continue
+        out.append((src, upload_image(drive, png), png_size(png)))
+    return out
 
 
 def _resolve_image(drive, slide: Slide, base_dir=Path(".")):
@@ -1777,6 +1913,8 @@ def _slide_from_native(s, links: dict[str, str] | None = None) -> Slide:
         if "table" in el:
             table = _table_from_native(el["table"])
         elif "image" in el:
+            if _EQ_IMG_RE.search(el.get("objectId", "")):
+                continue  # a rendered $$-equation; its source round-trips via the marker
             image_el = image_el or el
         elif el.get("shape", {}).get("text"):
             paras = _paras_from_shape(el["shape"], links)
@@ -1810,6 +1948,7 @@ def _slide_from_native(s, links: dict[str, str] | None = None) -> Slide:
     key = marker.get("id") or _slug(title) or s["objectId"]
     slide = Slide(key, layout, title=title, paras=body, image=image,
                   image_alt=image_alt, table=table, notes=notes)
+    slide.equations = _marker_equations(marker)
     slide.layout_name = marker.get("tpl") or ("section" if layout == "section"
                                               else None)
     return slide
@@ -1955,10 +2094,11 @@ def _text_requests(eid: str, text: dict) -> list[dict]:
 
 def _slide_from_marker(marker: dict, notes: str) -> Slide:
     """Reconstruct a tagged-template slide from its notes marker (source of truth)."""
-    _headings, paras, _, _, _, _, _ = parse_body(marker.get("body", ""))
+    _headings, paras, _, _, _, _, _, _ = parse_body(marker.get("body", ""))
     img = marker.get("img")
     slide = Slide(marker["id"], "image" if img else "content",
                   marker.get("h1", ""), paras, image=img, notes=notes)
+    slide.equations = _marker_equations(marker)
     slide.image_alt = marker.get("alt", "")
     slide.kicker = marker.get("h2", "")
     slide.template_name = marker["template"]
@@ -2090,6 +2230,11 @@ def _read_notes(s) -> str:
 def _read_marker(notes: str) -> dict:
     m = MARKER_RE.search(notes)
     return json.loads(m.group("json")) if m else {}
+
+
+def _marker_equations(marker: dict) -> list[str]:
+    """Verbatim `$$...$$` LaTeX sources stashed (base64) in the notes marker."""
+    return [base64.b64decode(e).decode() for e in marker.get("eq", [])]
 
 
 def write_slidev(slides: list[Slide], path: Path):
@@ -2242,6 +2387,18 @@ id: data
 | --- | --- |
 | AUROC | 0.93 |
 | Gap | small |
+
+---
+id: maths
+---
+
+## Display maths
+
+Monitor effectiveness factors:
+
+$$
+E = p_{mon} \\times r_{mon} \\times (1 - FPR) \\times r_{hum}
+$$
 
 ---
 template: label
@@ -2407,7 +2564,7 @@ def cmd_comments(args):
 def text_lines_md(src: str) -> list[str]:
     """Markdown slide body -> normalised visible text lines (comments excluded)."""
     fences = [m.group("text") for m in VERBATIM_RE.finditer(src)]
-    headings, paras, _img, _alt, _mmd, table, _ = parse_body(VERBATIM_RE.sub("", src))
+    headings, paras, _img, _alt, _mmd, table, _, _eq = parse_body(VERBATIM_RE.sub("", src))
     lines = [headings[k] for k in sorted(headings)]
     lines += [p.text for p in paras]
     if table:
@@ -2528,6 +2685,9 @@ def _slide_from_live_boxes(s, marker: dict,
     slide = Slide(marker.get("id", sid), "content")
     slide.template_name = marker.get("template")
     slide.vars = marker.get("vars", {})
+    # live text edits never touch the equation images; keep the $$ blocks so a
+    # live-drift write-back doesn't drop them from the markdown
+    slide.equations = _marker_equations(marker)
     if (slide.template_name or "").lower() in ("prompt", "code"):
         slide.title = _flatten(paras("_k")).strip()
         slide.verbatim = "\n".join(p.text for p in paras("_b"))

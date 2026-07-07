@@ -17,7 +17,8 @@ def _slide(key):
 
 def test_sample_parses_all_slides():
     slides = build_slides(split_slides(SAMPLE))
-    assert [s.key for s in slides] == ["intro", "findings", "data", "ask", "titlecard"]
+    assert [s.key for s in slides] == [
+        "intro", "findings", "data", "maths", "ask", "titlecard"]
 
 
 def test_nested_bullets_round_trip_through_render():
