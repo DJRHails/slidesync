@@ -510,5 +510,23 @@ def test_batch_genuine_duplicate_still_raises(monkeypatch):
         _sync._batch(api, DECK, reqs)
 
 
+def test_batch_bullets_only_chunk_error_still_raises(monkeypatch):
+    """createParagraphBullets targets an EXISTING text box, so its objectId must
+    not count as a created id: in a chunk with no genuine creates or deletes, a
+    genuine rejection (bad textRange, invalid preset) would otherwise look like
+    a replay — the target boxes are always live — and be silently skipped."""
+    monkeypatch.setattr(_sync, "_BATCH_CHUNK", 2)
+    reqs = [{"createParagraphBullets": {
+                "objectId": "box",
+                "textRange": {"type": "FIXED_RANGE", "startIndex": 9, "endIndex": 5},
+                "bulletPreset": "BULLET_DISC_CIRCLE_SQUARE"}},
+            {"updateTextStyle": {"objectId": "box", "textRange": {"type": "ALL"},
+                                 "style": {}, "fields": "*"}}]
+    api = _ReplayFake(live={"s1", "box"}, fail_call=0)  # box already exists
+
+    with pytest.raises(HttpError):
+        _sync._batch(api, DECK, reqs)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
