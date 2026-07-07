@@ -4,7 +4,7 @@ Bidirectional sync between a [Slidev](https://sli.dev) markdown deck and **Googl
 Slides** — as native, editable objects (title/body/bullets/tables/positioned
 images, brand-styled text boxes), not pasted screenshots.
 
-Version: 0.10.4
+Version: 0.10.5
 
 ```bash
 uvx slidesync --help            # run without installing
