@@ -125,12 +125,6 @@ may have its own frontmatter (`id:`, `template:`, `layout:`, `hidden:`).
 - Bullets `-`/`*`; ordered `1.` (nest with 2-space indent). Inline
   `**bold**` / `*italic*` / `` `code` `` / `==highlight==` / `[link](url)`.
   GFM tables.
-- **Highlight:** `==text==` (the markdown-it-mark dialect; delimiters must be
-  non-space-adjacent, so a bare `a == b` stays prose) renders as a warm amber
-  wash (`#FFE08A`) behind the run, with the text pinned to ink so the mark
-  stays legible on the dark templates too. Composes with the other inline
-  styles run-by-run, and round-trips: `pull` reads the background wash back to
-  `==text==` byte-identically.
   `![alt](path)` images (uploaded to Drive; `alt` becomes the accessibility
   description, round-tripped on pull). Blank lines preserved as spacing.
   `<!-- notes -->` become speaker notes — and round-trip as **comments, in
@@ -138,6 +132,12 @@ may have its own frontmatter (`id:`, `template:`, `layout:`, `hidden:`).
   re-emits each comment where it was written instead of one merged trailing
   blob. Speaker notes edited live in Slides come back as one extra trailing
   comment.
+- **Highlight:** `==text==` (the markdown-it-mark dialect; delimiters must be
+  non-space-adjacent, so a bare `a == b` stays prose) renders as a warm amber
+  wash (`#FFE08A`) behind the run, with the text pinned to ink so the mark
+  stays legible on the dark templates too. Composes with the other inline
+  styles run-by-run, and round-trips: `pull` reads the background wash back to
+  `==text==` byte-identically.
 - **Internal links:** `[text](#slide-id)` becomes a native Slides link to the
   slide whose `id:` (or title slug) is `slide-id`, and round-trips: `pull` reads
   the native page-link back to `[text](#slide-id)` (so it no longer churns).
