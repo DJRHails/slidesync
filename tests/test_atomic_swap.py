@@ -401,5 +401,43 @@ def test_replacing_a_link_target_keeps_intra_deck_link(tmp_path, monkeypatch):
     assert targets == ["#appendix"], "link must re-resolve to the swapped target"
 
 
+class _ChunkRecorder:
+    """Bare batchUpdate fake: records each call's request list."""
+
+    def __init__(self):
+        self.calls = []
+
+    def presentations(self):
+        return self
+
+    def batchUpdate(self, presentationId, body):
+        self.calls.append(body["requests"])
+        return self
+
+    def execute(self):
+        return {}
+
+
+def test_batch_chunks_oversized_request_lists_in_order():
+    """A whole-deck force push emits tens of thousands of requests; one HTTP
+    call that size breaks the connection. `_batch` must split into sequential
+    `batchUpdate` calls of at most `_BATCH_CHUNK` requests, preserving the
+    request order end-to-end (order is what the blue-green swap relies on)."""
+    api = _ChunkRecorder()
+    reqs = [{"n": i} for i in range(2 * _sync._BATCH_CHUNK + 201)]
+
+    _sync._batch(api, DECK, reqs)
+
+    assert [len(c) for c in api.calls] == [_sync._BATCH_CHUNK,
+                                           _sync._BATCH_CHUNK, 201]
+    assert [r["n"] for call in api.calls for r in call] == list(range(len(reqs)))
+
+
+def test_batch_small_request_list_stays_one_call():
+    api = _ChunkRecorder()
+    _sync._batch(api, DECK, [{"n": 0}, {"n": 1}])
+    assert [len(c) for c in api.calls] == [2]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

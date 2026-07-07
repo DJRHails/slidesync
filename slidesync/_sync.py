@@ -1841,9 +1841,20 @@ def _resolve_image(drive, slide: Slide, base_dir=Path(".")):
     return upload_image(drive, p), png_size(p)
 
 
+# One batchUpdate per _BATCH_CHUNK requests. Google applies a call's requests
+# in order, and sequential calls preserve that order, so the final deck state
+# is identical to a single call — but a whole-deck force push in one call
+# overflows the HTTP request itself (broken pipe at ~16k requests). The cost is
+# atomicity: a failure between chunks leaves a partially-applied push, which a
+# plain sync reconciles (same recovery as any failed push).
+_BATCH_CHUNK = 500
+
+
 def _batch(slides_api, deck, requests):
-    slides_api.presentations().batchUpdate(
-        presentationId=deck, body={"requests": requests}).execute()
+    for start in range(0, len(requests), _BATCH_CHUNK):
+        slides_api.presentations().batchUpdate(
+            presentationId=deck,
+            body={"requests": requests[start:start + _BATCH_CHUNK]}).execute()
 
 
 def _apply_notes(slides_api, deck, creates):
