@@ -101,6 +101,10 @@ class FakeStore:
                 rest = [s for s in self.slides if s["id"] != oid]
                 rest.insert(r["updateSlidesPosition"]["insertionIndex"], moved)
                 self.slides = rest
+            elif "updateSlideProperties" in r:
+                up = r["updateSlideProperties"]
+                self._slide(up["objectId"])["skipped"] = \
+                    up["slideProperties"].get("isSkipped", False)
             # styling-only requests are ignored
         return {}
 
@@ -114,7 +118,8 @@ class FakeStore:
             nid = s["id"] + "_n"
             out.append({
                 "objectId": s["id"], "pageElements": els,
-                "slideProperties": {"notesPage": {
+                "slideProperties": {"isSkipped": s.get("skipped", False),
+                                    "notesPage": {
                     "notesProperties": {"speakerNotesObjectId": nid},
                     "pageElements": [{"objectId": nid, "shape": {
                         "text": {"textElements": _text_els(s["notes"])}}}]}}})

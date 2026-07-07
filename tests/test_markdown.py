@@ -44,3 +44,19 @@ def test_coalesce_adjacent_same_style_runs():
 def test_render_inline_keeps_whitespace_outside_marks():
     # a bold run that includes trailing spaces must not emit `**ok  **` (invalid)
     assert render_inline("ok  done", [Run(0, 4, "bold")]) == "**ok**  done"
+
+
+def test_image_alt_with_brackets_parses_as_image():
+    # A Wilson-CI bracket in the alt ("[1.7–3.1]") must not truncate the image match.
+    # Regression: IMAGE_RE's alt group once forbade ']', so the ![](…) line fell through
+    # into the slide body and a text-free `graph` slide rendered blank on push.
+    md = (
+        "---\ntheme: seriph\n---\n\n"
+        "---\ntemplate: graph\nid: fig\n---\n"
+        "![a leak at 2.3% [1.7–3.1]; the rest hold](../figures/x.png)\n"
+    )
+    slide = next(s for s in build_slides(split_slides(md)) if s.key == "fig")
+    assert slide.image == "../figures/x.png"
+    assert slide.image_alt == "a leak at 2.3% [1.7–3.1]; the rest hold"
+    assert not any("![" in p.text for p in slide.paras), "image must not fall through to body"
+    assert "![a leak at 2.3% [1.7–3.1]; the rest hold](../figures/x.png)" in to_slidev(slide)

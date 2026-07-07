@@ -113,9 +113,15 @@ comments in place).
 ## Markdown dialect
 
 Top-level frontmatter: `theme:`, `deck:`. Slides separated by `---`; each slide
-may have its own frontmatter (`id:`, `template:`, `layout:`).
+may have its own frontmatter (`id:`, `template:`, `layout:`, `hidden:`).
 
 - `# h1` = headline, `## h2` above an `# h1` = kicker; a lone `##` is the title.
+- **Hidden slides:** `hidden: true` (or `hide: true`) marks a slide **skipped**
+  in the presentation — still a native, editable slide, just hidden in present
+  mode (via the Slides API's `isSkipped`), the analogue of Slidev's `hidden`
+  frontmatter. It's part of the content hash, so toggling it re-pushes, and it
+  round-trips: `pull` reads the live skipped state back to `hidden: true` (so a
+  slide skipped natively in Slides comes back hidden too).
 - Bullets `-`/`*`; ordered `1.` (nest with 2-space indent). Inline
   `**bold**` / `*italic*` / `` `code` `` / `[link](url)`. GFM tables.
   `![alt](path)` images (uploaded to Drive; `alt` becomes the accessibility

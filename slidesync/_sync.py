@@ -94,7 +94,7 @@ BODY_X, BODY_Y = 457200, 1143000
 BODY_W, BODY_H = 8229600, 3771900
 
 SECTION_LAYOUTS = {"section", "center", "cover", "intro"}
-RESERVED_KEYS = {"id", "template", "layout"}
+RESERVED_KEYS = {"id", "template", "layout", "hidden", "hide"}
 
 # Brand palette extracted from the Reliable Monitors deck (IBM Plex Sans).
 BRAND_FONT = "IBM Plex Sans"
@@ -224,6 +224,7 @@ class Slide:
     key_hash: str = ""
     content_hash: str = ""
     object_id: str = ""
+    hidden: bool = False  # `hidden:`/`hide:` frontmatter -> slide skipped in Slides
 
     def semantic(self) -> tuple:
         def runs(p):
@@ -233,7 +234,7 @@ class Slide:
         return (self.key, self.layout_name, self.template_name,
                 tuple(sorted(self.vars.items())), self.layout, self.title,
                 self.kicker, paras, table, self.image, self.image_alt,
-                self.notes)
+                self.notes, self.hidden)
 
 
 def _u16(text: str) -> int:
@@ -246,6 +247,12 @@ def _slug(text: str) -> str:
 
 def _sha10(text: str) -> str:
     return hashlib.sha1(text.encode()).hexdigest()[:10]
+
+
+def _is_truthy(val) -> bool:
+    """A frontmatter flag is on for `true`/`1`/`yes`/`on` (the YAML shim parses
+    values as bare strings); anything else — including absent or `false` — is off."""
+    return str(val).strip().lower() in {"true", "1", "yes", "on"}
 
 
 def _image_bytes_hash(slide: Slide, base_dir: Path = Path(".")) -> str | None:
@@ -279,7 +286,10 @@ VCLICK_RE = re.compile(r"</?v-clicks?\b[^>]*>", re.I)
 DIV_RE = re.compile(r"</?(?:div|span)\b[^>]*>", re.I)
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 LIST_RE = re.compile(r"^(?P<indent>\s*)(?P<marker>[-*]|\d+\.)\s+(?P<text>.*)$")
-IMAGE_RE = re.compile(r"^!\[(?P<alt>[^\]]*)\]\((?P<url>[^)]+)\)\s*$")
+# alt text may contain a `]` (e.g. a Wilson CI "[1.7–3.1]"); greedy `.*` binds to the FINAL
+# `](url)` so a bracket in the caption doesn't truncate the match and silently drop the image
+# into the slide body (which renders blank on a text-free `graph` template).
+IMAGE_RE = re.compile(r"^!\[(?P<alt>.*)\]\((?P<url>[^)]+)\)\s*$")
 COMMENT_RE = re.compile(r"<!--(?P<body>.*?)-->", re.S)
 CUSTOM_RE = re.compile(
     r"""(?msx)              # multiline, dotall, verbose
@@ -419,6 +429,7 @@ def build_slide(meta: dict, body: str, index: int) -> Slide:
     slide.vars = {k: v for k, v in meta.items() if k not in RESERVED_KEYS}
     slide.custom = custom
     slide.verbatim = verbatim
+    slide.hidden = _is_truthy(meta.get("hidden") or meta.get("hide"))
     if custom is None:  # custom slides are pull-authoritative; their source goes stale
         slide.src = authored
     return _finalize(slide)
@@ -636,6 +647,8 @@ def to_slidev(slide: Slide, include_id: bool = True) -> str:
             fm[k] = slide.vars[k]
     elif slide.layout_name:
         fm["layout"] = slide.layout_name
+    if slide.hidden:  # skipped-in-Slides flag; independent of template/layout
+        fm["hidden"] = "true"
     if include_id:
         fm["id"] = slide.key
     out = []
@@ -1444,6 +1457,7 @@ def push(slides_api, drive, deck, source, anchor, prune, base_dir=Path("."),
     if reqs:
         _batch(slides_api, deck, reqs)
     _apply_notes(slides_api, deck, creates)
+    _apply_skip(slides_api, deck, creates)
     _restore_threads(drive, deck, creates)
     _reorder(slides_api, deck, source, anchor)
     _apply_internal_links(slides_api, deck, source)
@@ -1613,6 +1627,26 @@ def _apply_notes(slides_api, deck, creates):
         _batch(slides_api, deck, reqs)
 
 
+def _apply_skip(slides_api, deck, creates) -> None:
+    """Mark `hidden:` slides as skipped (hidden in present mode) — the Slides
+    analogue of Slidev's `hidden` frontmatter.
+
+    Applied only to freshly created/replaced slides: `hidden` is part of the
+    content hash, so toggling it re-creates the slide (defaulting to un-skipped)
+    and re-runs this pass, which re-skips it iff it is still hidden. Best-effort,
+    like `_hide_templates` — an older API surface may not expose `isSkipped`.
+    """
+    hidden = [s.object_id for s in creates if s.hidden]
+    if not hidden:
+        return
+    try:
+        _batch(slides_api, deck, [{"updateSlideProperties": {
+            "objectId": oid, "slideProperties": {"isSkipped": True},
+            "fields": "isSkipped"}} for oid in hidden])
+    except Exception as e:  # noqa: BLE001 - API may not expose isSkipped
+        logger.warning(f"could not mark slides hidden (skipped): {e}")
+
+
 def _notes_shape_id(slide):
     notes_page = slide.get("slideProperties", {}).get("notesPage", {})
     nid = notes_page.get("notesProperties", {}).get("speakerNotesObjectId")
@@ -1701,7 +1735,12 @@ def pull_slides(slides_api, deck, managed_only=True) -> list[Slide]:
     for s in pres_slides:
         if managed_only and not MANAGED_RE.match(s["objectId"]):
             continue
-        out.append(_finalize(_slide_from_native(s, links)))
+        slide = _slide_from_native(s, links)
+        # A skipped slide round-trips as `hidden: true` — the live isSkipped is
+        # authoritative, so a native skip toggle in Slides pulls back too. Set it
+        # before _finalize so `hidden` lands in the canonical hash.
+        slide.hidden = bool(s.get("slideProperties", {}).get("isSkipped"))
+        out.append(_finalize(slide))
     return out
 
 
@@ -2725,7 +2764,7 @@ def _compare(src: list[Slide], got: list[Slide]) -> bool:
         for fa, fb, name in zip(a.semantic(), b.semantic(),
                                 ["key", "layout_name", "template_name", "vars",
                                  "layout", "title", "kicker", "paras", "table",
-                                 "image", "notes"]):
+                                 "image", "image_alt", "notes", "hidden"]):
             if fa != fb:
                 logger.error(f"    {name}: {fa!r} != {fb!r}")
     logger.log("SUCCESS" if ok else "ERROR",
