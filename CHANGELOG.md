@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.11.0
+
+### `gslides-overlay` — raw requests on top of a templated slide
+
+A ```` ```gslides-overlay ```` fenced block on a normal templated/generative
+slide replays its literal Slides API requests **after** the slide's own render
+on every push (`__PAGE__` substituted by the slide page id) — for annotation
+text boxes, arrows, and callouts no template expresses. Markdown is the source
+of truth: the block folds into the content hash, round-trips through the notes
+marker on `pull`, and a content-changing push recreates the drawn elements
+(native edits to them are not written back). Drift detection counts the
+overlay's `insertText` lines as visible text — never its raw JSON — so an
+overlaid slide reads as clean, and a live-drift write-back preserves the
+authored block. On a ```` ```gslides ```` custom slide the overlay is ignored
+with a warning (the slide already carries raw requests).
+
 ## 0.10.4
 
 ### Mass re-key guard

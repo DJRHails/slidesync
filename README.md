@@ -199,6 +199,37 @@ requests (use `__PAGE__` for the slide page id). Sync is **pull-authoritative /
 push-if-missing**: the Slides copy is the source of truth — `push` only creates
 the slide when missing, `pull` captures the live drawing back into the block.
 
+### Overlays — raw requests on top of a templated slide
+
+A ```` ```gslides-overlay ```` block rides on a **normal templated/generative
+slide** (unlike ```` ```gslides ````, which replaces the whole slide): its
+literal Slides API requests are replayed **after** the slide's own render on
+every push, with `__PAGE__` substituted by the slide page id. Use it for
+annotation text boxes, arrows, or callouts a template can't express:
+
+````markdown
+---
+template: graph
+id: fig-thinking-off
+---
+![...](figure.png)
+
+```gslides-overlay
+{"requests": [
+  {"createShape": {"objectId": "__PAGE___label", "shapeType": "TEXT_BOX",
+    "elementProperties": {"pageObjectId": "__PAGE__", "size": {...}, "transform": {...}}}},
+  {"insertText": {"objectId": "__PAGE___label", "text": "Thinking Off"}}
+]}
+```
+````
+
+The **markdown is the source of truth**: the block is part of the content hash
+(edits re-push), it round-trips through the notes marker on `pull`, and a
+content-changing push recreates the drawn elements — native edits to them in
+Slides are not written back. Drift detection counts the overlay's `insertText`
+lines as visible text, so an overlaid slide reads as clean. Prefix element ids
+with `__PAGE__` so they stay unique across re-pushes.
+
 ## Development
 
 ```bash

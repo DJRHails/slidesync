@@ -242,6 +242,7 @@ class Slide:
     template_name: str | None = None  # explicit `template:` — tagged styled slide
     vars: dict = field(default_factory=dict)  # extra frontmatter -> {{token}} values
     custom: str | None = None  # ```gslides``` literal Slides API requests (JSON)
+    overlay: str | None = None  # ```gslides-overlay``` requests replayed on the render
     verbatim: str | None = None  # ``` ``` fenced body for prompt/code slides
     src: str | None = None  # body markdown as authored (comments in place)
     src_path: Path | None = None  # source file this slide was loaded from
@@ -259,7 +260,7 @@ class Slide:
         return (self.key, self.layout_name, self.template_name,
                 tuple(sorted(self.vars.items())), self.layout, self.title,
                 self.kicker, paras, table, self.image, self.image_alt,
-                self.notes, self.hidden, tuple(self.equations))
+                self.notes, self.hidden, tuple(self.equations), self.overlay)
 
 
 def _u16(text: str) -> int:
@@ -321,6 +322,13 @@ CUSTOM_RE = re.compile(
     ^```\ *g?slides\ *\n    # fence opening with a gslides/slides lang tag
     (?P<json>.*?)           # the literal Slides API requests (JSON)
     \n```\ *$               # fence close
+    """
+)
+OVERLAY_RE = re.compile(
+    r"""(?msx)                     # multiline, dotall, verbose
+    ^```\ *gslides-overlay\ *\n    # fence opening with a gslides-overlay lang tag
+    (?P<json>.*?)                  # literal Slides API requests (JSON)
+    \n```\ *$                      # fence close
     """
 )
 MERMAID_RE = re.compile(
@@ -446,6 +454,9 @@ def build_slides(chunks: list[tuple[dict, str]]) -> list[Slide]:
 
 def build_slide(meta: dict, body: str, index: int) -> Slide:
     authored = body.strip("\n")
+    # overlay first: VERBATIM_RE (prompt/code) grabs whichever fence comes first
+    # in the body, so the overlay block must already be gone by then
+    overlay, body = _extract_overlay(body)
     custom, body = _extract_custom(body)
     verbatim = None
     if (meta.get("template") or "").lower() in ("prompt", "code"):
@@ -462,6 +473,11 @@ def build_slide(meta: dict, body: str, index: int) -> Slide:
     slide.template_name = "custom" if custom is not None else meta.get("template")
     slide.vars = {k: v for k, v in meta.items() if k not in RESERVED_KEYS}
     slide.custom = custom
+    if custom is not None and overlay is not None:
+        logger.warning(f"slide '{key}': ```gslides-overlay``` ignored — a "
+                       "```gslides``` slide already carries raw requests")
+        overlay = None
+    slide.overlay = overlay
     slide.verbatim = verbatim
     slide.hidden = _is_truthy(meta.get("hidden") or meta.get("hide"))
     if custom is None:  # custom slides are pull-authoritative; their source goes stale
@@ -582,6 +598,14 @@ def _thread_blocks(src: str | None) -> list[list[tuple[str, str]]]:
 def _extract_custom(body: str) -> tuple[str | None, str]:
     """Pull a ```gslides``` literal-requests block out of the body, if present."""
     m = CUSTOM_RE.search(body)
+    if not m:
+        return None, body
+    return m.group("json").strip(), body[:m.start()] + body[m.end():]
+
+
+def _extract_overlay(body: str) -> tuple[str | None, str]:
+    """Pull a ```gslides-overlay``` literal-requests block out of the body, if present."""
+    m = OVERLAY_RE.search(body)
     if not m:
         return None, body
     return m.group("json").strip(), body[:m.start()] + body[m.end():]
@@ -743,6 +767,8 @@ def to_slidev(slide: Slide, include_id: bool = True) -> str:
     # the stored LaTeX is verbatim (delimiters stripped at parse time), so the
     # re-emitted block is byte-identical to what was authored
     out += [f"$${eq}$$" for eq in slide.equations]
+    if slide.overlay is not None:
+        out += ["```gslides-overlay", slide.overlay, "```"]
     if slide.image:
         out.append(f"![{slide.image_alt}]({slide.image})")
     if slide.table:
@@ -1212,6 +1238,25 @@ def _graph_requests(slide: Slide, image_url, image_px) -> list[dict]:
     return reqs
 
 
+def _literal_requests(raw: str, sid: str, where: str) -> list[dict] | None:
+    """Parse a literal Slides-API-requests block; `__PAGE__` -> `sid`.
+
+    Accepts a JSON list of requests or `{"requests": [...]}`. Returns `None`
+    (with the cause logged) on malformed input so callers can degrade —
+    render what they can — instead of aborting the push.
+    """
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        logger.error(f"{where}: invalid JSON ({exc})")
+        return None
+    body = payload.get("requests", payload) if isinstance(payload, dict) else payload
+    if not isinstance(body, list):
+        logger.error(f"{where}: expected a list of requests or {{'requests': [...]}}")
+        return None
+    return json.loads(json.dumps(body).replace("__PAGE__", sid))
+
+
 def _custom_requests(slide: Slide) -> list[dict]:
     """Build a custom slide by replaying its literal Slides API requests.
 
@@ -1223,18 +1268,31 @@ def _custom_requests(slide: Slide) -> list[dict]:
     sid = slide.object_id
     reqs = [{"createSlide": {"objectId": sid,
                              "slideLayoutReference": {"predefinedLayout": "BLANK"}}}]
-    try:
-        payload = json.loads(slide.custom)
-    except json.JSONDecodeError as exc:
-        logger.error(f"custom slide '{slide.key}': invalid JSON ({exc}); left blank")
+    body = _literal_requests(slide.custom, sid, f"custom slide '{slide.key}'")
+    if body is None:
+        logger.error(f"custom slide '{slide.key}': left blank")
         return reqs
-    body = payload.get("requests", payload) if isinstance(payload, dict) else payload
-    if not isinstance(body, list):
-        logger.error(f"custom slide '{slide.key}': expected a list of requests "
-                     "or {{'requests': [...]}}; left blank")
-        return reqs
-    reqs += json.loads(json.dumps(body).replace("__PAGE__", sid))
-    return reqs
+    return reqs + body
+
+
+def _overlay_requests(slide: Slide) -> list[dict]:
+    """Replay a ```gslides-overlay``` block on top of a templated slide's render.
+
+    Unlike ```gslides``` (whole-slide custom, pull-authoritative), an overlay
+    rides on a normal templated/generative slide: its requests are appended
+    after the slide's own render on every (re)push, with `__PAGE__` substituted
+    by the slide's objectId. The markdown is the source of truth — editing the
+    drawn elements natively in Slides is not written back, and a
+    content-changing push recreates them from the block.
+    """
+    if slide.overlay is None:
+        return []
+    body = _literal_requests(slide.overlay, slide.object_id,
+                             f"overlay on '{slide.key}'")
+    if body is None:
+        logger.error(f"overlay on '{slide.key}': skipped")
+        return []
+    return body
 
 
 def _fit_body_pt(text: str, base: int = 11, floor: int = 6,
@@ -1295,6 +1353,15 @@ def _warn_dropped_equations(slide: Slide, where: str) -> None:
 
 def slide_requests(slide: Slide, image_url, image_px,
                    layouts=None, templates=None, equations=()) -> list[dict]:
+    """Full request list for one slide: its template/generative render, plus any
+    ```gslides-overlay``` block replayed on top (custom slides carry no overlay)."""
+    reqs = _templated_requests(slide, image_url, image_px, layouts=layouts,
+                               templates=templates, equations=equations)
+    return reqs + _overlay_requests(slide)
+
+
+def _templated_requests(slide: Slide, image_url, image_px,
+                        layouts=None, templates=None, equations=()) -> list[dict]:
     if slide.custom is not None:
         _warn_dropped_equations(slide, "custom (```gslides```)")
         return _custom_requests(slide)
@@ -2338,6 +2405,9 @@ def _slide_from_marker(marker: dict, notes: str) -> Slide:
     slide.vars = marker.get("vars", {})
     if "src" in marker:
         slide.src = base64.b64decode(marker["src"]).decode()
+        # the authored source carries any ```gslides-overlay``` fence; surface it
+        # on the field too so hashing / write-back see the same slide as authoring
+        slide.overlay, _ = _extract_overlay(slide.src)
     return slide
 
 
@@ -2875,13 +2945,15 @@ def _content_lines(src: str | None, template: str | None) -> list[str] | None:
     text on them can never reach the deck — comparing it against the live slide
     would report drift forever. The equation template drops its `# h1` (only
     the `##` kicker renders), so that heading is removed from the comparison
-    for the same reason.
+    for the same reason. A ```gslides-overlay``` block renders on ANY template,
+    so its insertText lines count as visible (and its raw JSON does not).
     """
     if src is None:
         return None
+    overlay, src = _extract_overlay(src)
     tpl = (template or "").lower()
     if tpl in ("graph", "full"):
-        return []
+        return _norm_lines(_overlay_texts(overlay))
     lines = text_lines_md(src)
     if tpl == "equation":
         headings, *_ = parse_body(VERBATIM_RE.sub("", src))
@@ -2889,7 +2961,22 @@ def _content_lines(src: str | None, template: str | None) -> list[str] | None:
             h1 = " ".join(headings[1].split())
             if h1 in lines:
                 lines.remove(h1)
-    return lines
+    return _norm_lines(lines + _overlay_texts(overlay))
+
+
+def _overlay_texts(overlay: str | None) -> list[str]:
+    """Visible text an overlay block inserts — its insertText payloads' lines."""
+    if overlay is None:
+        return []
+    try:
+        payload = json.loads(overlay)
+    except json.JSONDecodeError:
+        return []  # push logs the parse error; drift just sees no overlay text
+    body = payload.get("requests", payload) if isinstance(payload, dict) else payload
+    if not isinstance(body, list):
+        return []
+    return [ln for req in body if isinstance(req, dict)
+            for ln in req.get("insertText", {}).get("text", "").splitlines()]
 
 
 def _styled_runs(paras: list[Para]) -> list[tuple]:
@@ -3173,6 +3260,7 @@ def cmd_sync(args):
                 if rekeyed:
                     # About to be recreated: write the full live styling back
                     # first, or the re-key push would rebuild the slide bare.
+                    restyled.overlay = sl.overlay  # keep the authored block
                     restyled.notes = " ".join(
                         MARKER_RE.sub("", _read_notes(s)).split())
                     new = _replace_slide_body(texts[src_path], sl.src_key,
@@ -3212,6 +3300,7 @@ def cmd_sync(args):
                    if status in ("live-drift", "drift-no-base")
                    and marker.get("template") else None)
         if rebuilt and (rebuilt.title or rebuilt.paras or rebuilt.verbatim):
+            rebuilt.overlay = sl.overlay  # a body re-render must not drop the block
             rebuilt.notes = " ".join(MARKER_RE.sub("", _read_notes(s)).split())
             new = _replace_slide_body(texts[src_path], sl.src_key,
                                       _render_body(rebuilt))
@@ -3225,8 +3314,7 @@ def cmd_sync(args):
         conflicts.append(sl.key)
         logger.error(f"[conflict  ] {sl.key} (pushed {marker.get('at', '?')}) — "
                      f"resolve in the markdown, then push:\n"
-                     + _diff(base or [], text_lines_md(sl.src or ""),
-                             "last-pushed", "local") + "\n"
+                     + _diff(base or [], local, "last-pushed", "local") + "\n"
                      + _diff(base or [], live_lines, "last-pushed", "live"))
     for page, cs in by_page.items():  # threads on re-rendered (deleted) pages
         m = re.match(r"s2g_(?P<kh>[0-9a-f]{10})_", page)
