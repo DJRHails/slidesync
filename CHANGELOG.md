@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.11.2
+
+### Linked images — `[![alt](img)](href)`
+
+An image wrapped in a click-through link (the deck-variant convention: a
+cropped deck figure linking to the full titled one) now parses as an image
+instead of falling through to a body paragraph — which on a text-free
+`graph`/`full` template rendered a BLANK slide. Absolute http(s) hrefs are
+applied to the live image element as its link (`updateImageProperties`);
+relative repo-path hrefs keep the image and round-trip through the source but
+emit no live link. `pull` captures a foreign image's link back into the
+wrapper.
+
+## 0.11.1
+
+### Wrapping kickers reserve their true height
+
+A long brand-kit kicker used to overflow its fixed one-line box onto the
+headline below. The layout now estimates the kicker's wrapped line count and
+advances by its real height; single-line kickers keep the legacy geometry.
+
 ## 0.11.0
 
 ### `gslides-overlay` — raw requests on top of a templated slide

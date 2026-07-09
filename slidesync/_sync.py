@@ -233,6 +233,7 @@ class Slide:
     paras: list[Para] = field(default_factory=list)
     image: str | None = None
     image_alt: str = ""  # ![alt](path) -> image description / accessibility alt text
+    image_link: str | None = None  # [![alt](img)](href) -> click-through target
     mermaid: str | None = None  # ```mermaid``` source, rendered to a PNG on push
     table: list[list[str]] | None = None
     notes: str = ""
@@ -260,7 +261,8 @@ class Slide:
         return (self.key, self.layout_name, self.template_name,
                 tuple(sorted(self.vars.items())), self.layout, self.title,
                 self.kicker, paras, table, self.image, self.image_alt,
-                self.notes, self.hidden, tuple(self.equations), self.overlay)
+                self.notes, self.hidden, tuple(self.equations), self.overlay,
+                self.image_link)
 
 
 def _u16(text: str) -> int:
@@ -316,6 +318,18 @@ LIST_RE = re.compile(r"^(?P<indent>\s*)(?P<marker>[-*]|\d+\.)\s+(?P<text>.*)$")
 # `](url)` so a bracket in the caption doesn't truncate the match and silently drop the image
 # into the slide body (which renders blank on a text-free `graph` template).
 IMAGE_RE = re.compile(r"^!\[(?P<alt>.*)\]\((?P<url>[^)]+)\)\s*$")
+# The deck-variant convention wraps the embedded image in a link to the full
+# figure — [![alt](deck.png)](full.png) — an image plus a click-through href.
+LINKED_IMAGE_RE = re.compile(
+    r"""(?x)
+    ^\[                  # open of the wrapping [ ... ](href) link
+    !\[(?P<alt>.*)\]     # the image's alt text (greedy: alt may contain `]`)
+    \((?P<url>[^)]+)\)   # the image url
+    \]
+    \((?P<href>[^)]+)\)  # the click-through target
+    \s*$
+    """
+)
 COMMENT_RE = re.compile(r"<!--(?P<body>.*?)-->", re.S)
 CUSTOM_RE = re.compile(
     r"""(?msx)              # multiline, dotall, verbose
@@ -461,13 +475,14 @@ def build_slide(meta: dict, body: str, index: int) -> Slide:
     verbatim = None
     if (meta.get("template") or "").lower() in ("prompt", "code"):
         verbatim, body = _extract_verbatim(body)
-    headings, paras, image, image_alt, mermaid, table, notes, equations = parse_body(body)
+    (headings, paras, image, image_alt, mermaid, table, notes, equations,
+     image_link) = parse_body(body)
     h1, h2 = headings.get(1), headings.get(2)
     title = h1 or h2 or ""           # h1 is the headline; a lone h2 is the title
     kicker = h2 if (h1 and h2) else ""  # an h2 above an h1 is the kicker
     key = meta.get("id") or _slug(title) or f"slide{index}"
     slide = Slide(key, _layout_of(meta, image or mermaid, table), title, paras,
-                  image, image_alt, mermaid, table, notes, equations)
+                  image, image_alt, image_link, mermaid, table, notes, equations)
     slide.kicker = kicker
     slide.layout_name = meta.get("layout")
     slide.template_name = "custom" if custom is not None else meta.get("template")
@@ -517,7 +532,7 @@ def _layout_of(meta: dict, image, table) -> str:
 
 def parse_body(body: str):
     """Return (headings{level:text}, paras, image, image_alt, mermaid, table,
-    notes, equations)."""
+    notes, equations, image_link)."""
     notes = _extract_notes(body)
     body = COMMENT_RE.sub("", body)
     mermaid, body = _extract_mermaid(body)
@@ -525,6 +540,7 @@ def parse_body(body: str):
     body = VCLICK_RE.sub("", DIV_RE.sub("", body))
     lines = body.splitlines()
     headings, paras, image, table, image_alt = {}, [], None, None, ""
+    image_link = None
     i = 0
     while i < len(lines):
         line, stripped = lines[i], lines[i].strip()
@@ -538,6 +554,9 @@ def parse_body(body: str):
         if hm and level in (1, 2) and level not in headings and not paras:
             headings[level] = parse_inline(hm.group(2).strip())[0]
             i += 1
+        elif (lk := LINKED_IMAGE_RE.match(stripped)):
+            image, image_alt = lk.group("url"), lk.group("alt")
+            image_link, i = lk.group("href"), i + 1
         elif (im := IMAGE_RE.match(stripped)):
             image, image_alt, i = im.group("url"), im.group("alt"), i + 1
         elif "|" in line and i + 1 < len(lines) and TABLE_SEP_RE.match(lines[i + 1]):
@@ -548,7 +567,8 @@ def parse_body(body: str):
     while paras and not paras[-1].text and paras[-1].depth < 0 \
             and not paras[-1].runs:
         paras.pop()
-    return headings, paras, image, image_alt, mermaid, table, notes, equations
+    return (headings, paras, image, image_alt, mermaid, table, notes, equations,
+            image_link)
 
 
 def _is_thread(comment_body: str) -> bool:
@@ -770,7 +790,8 @@ def to_slidev(slide: Slide, include_id: bool = True) -> str:
     if slide.overlay is not None:
         out += ["```gslides-overlay", slide.overlay, "```"]
     if slide.image:
-        out.append(f"![{slide.image_alt}]({slide.image})")
+        img_md = f"![{slide.image_alt}]({slide.image})"
+        out.append(f"[{img_md}]({slide.image_link})" if slide.image_link else img_md)
     if slide.table:
         out += _render_table(slide.table)
     if slide.notes:
@@ -1206,8 +1227,7 @@ def _styled_requests(slide: Slide, style: Style, image_url, image_px,
                 "transform": {"scaleX": 1, "scaleY": 1, "unit": "EMU",
                               "translateX": (SLIDE_W - w) // 2,
                               "translateY": _emu(y)}}}})
-        if slide.image_alt:
-            reqs.append(_alt_req(sid + "_img", slide.image_alt))
+        reqs += _image_meta_reqs(sid + "_img", slide)
     return reqs
 
 
@@ -1241,8 +1261,7 @@ def _graph_requests(slide: Slide, image_url, image_px) -> list[dict]:
                 "transform": {"scaleX": 1, "scaleY": 1, "unit": "EMU",
                               "translateX": (SLIDE_W - w) // 2,
                               "translateY": (SLIDE_H - h) // 2}}}})
-        if slide.image_alt:
-            reqs.append(_alt_req(sid + "_img", slide.image_alt))
+        reqs += _image_meta_reqs(sid + "_img", slide)
     return reqs
 
 
@@ -1408,8 +1427,7 @@ def _templated_requests(slide: Slide, image_url, image_px,
         reqs += [_bg(slide.object_id, LIGHT_BG)] + _kicker(tid)
         if slide.layout == "image" and image_url:
             reqs.append(_image(slide, image_url, image_px))
-            if slide.image_alt:
-                reqs.append(_alt_req(slide.object_id + "_img", slide.image_alt))
+            reqs += _image_meta_reqs(slide.object_id + "_img", slide)
         elif slide.layout == "table" and slide.table:
             reqs += _table(slide)
     if equations:
@@ -1561,6 +1579,24 @@ def _merge(spans):
 def _alt_req(object_id: str, alt: str) -> dict:
     """Set an image element's accessibility alt text (its description)."""
     return {"updatePageElementAltText": {"objectId": object_id, "description": alt}}
+
+
+def _image_meta_reqs(object_id: str, slide: Slide) -> list[dict]:
+    """Alt text + click-through link for a slide's image element, when set.
+
+    A relative href (the repo-file convention, `[![...](deck.png)](full.png)`)
+    is meaningful in the markdown but not a valid Slides link target, so only
+    absolute http(s) hrefs are applied to the live element; the wrapper still
+    round-trips through the authored source either way.
+    """
+    reqs = []
+    if slide.image_alt:
+        reqs.append(_alt_req(object_id, slide.image_alt))
+    if slide.image_link and re.match(r"^https?://", slide.image_link):
+        reqs.append({"updateImageProperties": {"objectId": object_id,
+            "imageProperties": {"link": {"url": slide.image_link}},
+            "fields": "link"}})
+    return reqs
 
 
 def _image(slide, url, px) -> dict:
@@ -2247,15 +2283,18 @@ def _slide_from_native(s, links: dict[str, str] | None = None) -> Slide:
             body.append(Para("", [], -1))
         body.extend(paras)
 
-    image, image_alt = marker.get("img"), ""
+    image, image_alt, image_link = marker.get("img"), "", None
     if image is None and image_el is not None:  # foreign image: keep its live URL + alt
         image = image_el["image"].get("contentUrl") or image_el["image"].get("sourceUrl")
         image_alt = image_el.get("description") or image_el.get("title") or ""
+        image_link = (image_el["image"].get("imageProperties", {})
+                      .get("link", {}).get("url"))
 
     layout = _infer_layout(body, image, table)
     key = marker.get("id") or _slug(title) or s["objectId"]
     slide = Slide(key, layout, title=title, paras=body, image=image,
-                  image_alt=image_alt, table=table, notes=notes)
+                  image_alt=image_alt, image_link=image_link, table=table,
+                  notes=notes)
     slide.equations = _marker_equations(marker)
     slide.layout_name = marker.get("tpl") or ("section" if layout == "section"
                                               else None)
@@ -2402,7 +2441,7 @@ def _text_requests(eid: str, text: dict) -> list[dict]:
 
 def _slide_from_marker(marker: dict, notes: str) -> Slide:
     """Reconstruct a tagged-template slide from its notes marker (source of truth)."""
-    _headings, paras, _, _, _, _, _, _ = parse_body(marker.get("body", ""))
+    _headings, paras, *_ = parse_body(marker.get("body", ""))
     img = marker.get("img")
     slide = Slide(marker["id"], "image" if img else "content",
                   marker.get("h1", ""), paras, image=img, notes=notes)
@@ -2896,7 +2935,8 @@ def cmd_comments(args):
 def text_lines_md(src: str) -> list[str]:
     """Markdown slide body -> normalised visible text lines (comments excluded)."""
     fences = [m.group("text") for m in VERBATIM_RE.finditer(src)]
-    headings, paras, _img, _alt, _mmd, table, _, _eq = parse_body(VERBATIM_RE.sub("", src))
+    headings, paras, _img, _alt, _mmd, table, _, _eq, _lnk = parse_body(
+        VERBATIM_RE.sub("", src))
     lines = [headings[k] for k in sorted(headings)]
     lines += [p.text for p in paras]
     if table:
