@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.13.0
+
+### Graph-slide link footer
+
+The single link-only line on a `graph`/`full` slide (the trace-link
+convention: `[a →](url) · [b →](url)`) now renders as an 11pt right-aligned
+footer strip at the bottom of the slide instead of being dropped. The fit is
+aspect-aware: a wide image whose centred fit already leaves the strip free
+keeps its full size; only an image tall enough to collide shrinks, just
+enough to clear it. Drift detection counts the footer as rendered text, and
+slot validation allows at most one link-only line per slide (merge several
+into one ` · `-separated line).
+
 ## 0.12.0
 
 ### Template-slot validation — dropped content now fails the push

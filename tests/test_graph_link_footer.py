@@ -89,3 +89,12 @@ def test_two_link_lines_are_flagged():
     problems = validate_slots([s])
     assert len(problems) == 1
     assert "only ONE footer" in problems[0]
+
+
+def test_no_links_means_no_footer_and_no_reserved_space():
+    reqs = slide_requests(_slide("![f](fig.png)"), "https://drive/img", (1000, 1000))
+    img, box = _img_and_footer(reqs)
+    assert box is None  # no footer element at all
+    # full-bleed fit: the square image uses the full 0.1in-margin height
+    h = img["elementProperties"]["size"]["height"]["magnitude"]
+    assert h == SLIDE_H - 2 * int(0.1 * EMU_PER_IN)

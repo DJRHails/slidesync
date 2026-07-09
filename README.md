@@ -206,9 +206,14 @@ slot for (it would render as nothing, silently): a heading, table, or prose
 paragraph on a text-free `graph`/`full` slide; an `# h1` alongside the kicker
 on an `equation` slide; an image/table on `prompt`/`code`; an image on
 `equation`. Each violation names the slide and the fix — usually moving the
-content into a `<!-- comment -->`, which becomes speaker notes. Link-only
-paragraphs on text-free templates are exempt (the crop → full-figure
-trace-link convention).
+content into a `<!-- comment -->`, which becomes speaker notes.
+
+**Graph-slide link footer**: the one exception on `graph`/`full` — a single
+link-only paragraph (`[a →](url) · [b →](url)`, the trace-link convention)
+renders as an 11pt right-aligned footer strip at the bottom. The fit is
+aspect-aware: a wide image whose centred fit already leaves the strip free
+keeps its full size; a taller image shrinks just enough to clear it. More
+than one link-only line is a slot error — merge them into one line.
 
 ### Overlays — raw requests on top of a templated slide
 
