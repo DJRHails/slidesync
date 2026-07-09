@@ -1,9 +1,10 @@
 """End-to-end scenarios for push/sync against an in-memory Slides+Drive fake.
 
 The fake interprets exactly the request types slidesync emits (createSlide,
-deleteObject, createShape, insertText, deleteText, updateSlidesPosition) and
-renders state back in the wire format `presentations.get` returns — so push,
-the non-fast-forward guard, and sync's pull-back/capture all run unmodified.
+deleteObject, createShape, insertText, deleteText, updateSlidesPosition,
+updateSlideProperties, and updateTextStyle for washes and links) and renders
+state back in the wire format `presentations.get` returns — so push, the
+non-fast-forward guard, and sync's pull-back/capture all run unmodified.
 """
 
 import json
@@ -403,6 +404,59 @@ def test_live_wash_on_a_clean_slide_is_captured_as_highlight(env):
     assert "solid point" in marks
     _sync_cmd(env)  # idempotent: the re-pushed amber wash matches the source
     assert env.path.read_text().count("==solid point==") == 1
+
+
+@pytest.fixture
+def warnings_log():
+    """Warnings emitted through slidesync's loguru logger, as plain strings —
+    pytest's capfd/caplog can't see loguru's pre-captured stderr sink."""
+    msgs = []
+    handle = _sync.logger.add(msgs.append, format="{message}", level="WARNING")
+    yield msgs
+    _sync.logger.remove(handle)
+
+
+def _pushed_env(md, tmp_path, monkeypatch):
+    """A deck built from `md`, pushed to a fresh fake — for tests whose
+    scenario needs a source the shared MD fixture doesn't have."""
+    store, drive = FakeStore(), FakeDrive()
+    slides_api = FakeSlides(store)
+    monkeypatch.setattr(_sync, "get_services", lambda account: (slides_api, drive))
+    path = tmp_path / "deck.slidev.md"
+    path.write_text(md)
+    push(slides_api, drive, DECK, load_slides(path), anchor=None, prune=False,
+         base_dir=tmp_path)
+    return SimpleNamespace(store=store, drive=drive, slides=slides_api, path=path)
+
+
+def test_live_wash_without_verbatim_source_text_warns_and_stays(
+        tmp_path, monkeypatch, warnings_log):
+    """A wash spanning a formatting boundary ("One solid" over the source's
+    `One **solid** point.`) has no verbatim source text to wrap: sync must
+    warn asking for a hand edit and leave the source alone."""
+    env = _pushed_env(MD.replace("One solid point.", "One **solid** point."),
+                      tmp_path, monkeypatch)
+    before = env.path.read_text()
+    env.store.mark_text("One solid")
+    _sync_cmd(env)
+    assert env.path.read_text() == before
+    assert any("add ==...== by hand" in m for m in warnings_log)
+
+
+def test_live_wash_on_ambiguous_source_text_warns_instead_of_guessing(
+        tmp_path, monkeypatch, warnings_log):
+    """The washed text occurs twice in the slide's source — first in a note
+    comment, then in the body. First-occurrence substitution would wrap the
+    comment, where the wash never renders and so never converges. Sync must
+    warn and leave the source alone instead of guessing."""
+    env = _pushed_env(MD.replace("One solid point.\n\n<!-- presenter note A -->",
+                                 "<!-- a solid point, noted -->\n\nOne solid point."),
+                      tmp_path, monkeypatch)
+    before = env.path.read_text()
+    env.store.mark_text("solid point")
+    _sync_cmd(env)
+    assert env.path.read_text() == before
+    assert any("add ==...== by hand" in m for m in warnings_log)
 
 
 GRAPH_MD = MD + """
