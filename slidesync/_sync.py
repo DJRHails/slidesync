@@ -1239,20 +1239,42 @@ def _fit2(px, max_w, max_h):
     return int(w * scale), int(h * scale)
 
 
+# The single link-only line a graph slide may carry (the trace-link
+# convention) renders as a discreet right-aligned footer strip.
+GRAPH_FOOTER_PT = 11
+GRAPH_FOOTER_H = 0.28   # one 11pt line + padding, inches
+GRAPH_FOOTER_GAP = 0.06  # clearance between image and footer, inches
+
+
+def _graph_footer_para(slide: Slide) -> Para | None:
+    return next((p for p in slide.paras if p.text and _link_only_para(p)), None)
+
+
 def _graph_requests(slide: Slide, image_url, image_px) -> list[dict]:
-    """Full-bleed graph: a single image maximised to fill the page, no text.
+    """Full-bleed graph: a single image maximised to fill the page, no text —
+    except one optional link-only line, rendered as a right-aligned footer.
 
     For `template: graph` / `full` slides — the figure is self-titled, so the
     slide carries no kicker, headline, or body. The image is scaled to fit the
-    slide (aspect preserved) with a thin margin and centred both ways.
+    slide (aspect preserved) with a thin margin and centred both ways. With a
+    footer, a wide image whose centred fit already leaves the footer strip
+    free keeps its full size; only an image tall enough to collide shrinks.
     """
     sid = slide.object_id
     reqs = [{"createSlide": {"objectId": sid,
                              "slideLayoutReference": {"predefinedLayout": "BLANK"}}},
             _bg(sid, WHITE)]
+    footer = _graph_footer_para(slide)
     if slide.image and image_url:
         margin = _emu(0.1)
-        w, h = _fit2(image_px, SLIDE_W - 2 * margin, SLIDE_H - 2 * margin)
+        avail_h = SLIDE_H - 2 * margin
+        w, h = _fit2(image_px, SLIDE_W - 2 * margin, avail_h)
+        ty = (SLIDE_H - h) // 2
+        if footer is not None:
+            strip = _emu(GRAPH_FOOTER_H + GRAPH_FOOTER_GAP)
+            if (SLIDE_H - h) // 2 < strip:  # aspect ratio leaves no room: shrink
+                w, h = _fit2(image_px, SLIDE_W - 2 * margin, avail_h - strip)
+                ty = margin + (avail_h - strip - h) // 2
         reqs.append({"createImage": {
             "objectId": sid + "_img", "url": image_url,
             "elementProperties": {"pageObjectId": sid,
@@ -1260,8 +1282,18 @@ def _graph_requests(slide: Slide, image_url, image_px) -> list[dict]:
                          "height": {"magnitude": h, "unit": "EMU"}},
                 "transform": {"scaleX": 1, "scaleY": 1, "unit": "EMU",
                               "translateX": (SLIDE_W - w) // 2,
-                              "translateY": (SLIDE_H - h) // 2}}}})
+                              "translateY": ty}}}})
         reqs += _image_meta_reqs(sid + "_img", slide)
+    if footer is not None:
+        fid = sid + "_links"
+        y = SLIDE_H / EMU_PER_IN - 0.1 - GRAPH_FOOTER_H
+        reqs.append({"createShape": {"objectId": fid, "shapeType": "TEXT_BOX",
+            "elementProperties": {"pageObjectId": sid,
+                "size": {"width": {"magnitude": _emu(9.32), "unit": "EMU"},
+                         "height": {"magnitude": _emu(GRAPH_FOOTER_H), "unit": "EMU"}},
+                "transform": {"scaleX": 1, "scaleY": 1, "translateX": _emu(0.34),
+                              "translateY": _emu(y), "unit": "EMU"}}}})
+        reqs += _body(fid, [footer], align="END", size=GRAPH_FOOTER_PT)
     return reqs
 
 
@@ -1424,8 +1456,13 @@ def validate_slots(slides: list[Slide]) -> list[str]:
             prose = [p for p in s.paras if p.text and not _link_only_para(p)]
             if prose:
                 bad(s, f"body text {prose[0].text[:60]!r} never renders "
-                       "(text-free template; link-only lines are exempt)",
+                       "(text-free template; link-only lines render as the footer)",
                     "move it into a <!-- comment --> (speaker notes)")
+            links = [p for p in s.paras if p.text and _link_only_para(p)]
+            if len(links) > 1:
+                bad(s, f"{len(links)} link-only lines, but only ONE footer "
+                       "renders (right-aligned, bottom)",
+                    "merge them into a single ` · `-separated line")
         elif tpl == "equation":
             if s.title and s.kicker:
                 bad(s, f"`# {s.title[:60]}` never renders (only the `##` "
@@ -3066,19 +3103,22 @@ def _diff(a: list[str], b: list[str], a_name: str, b_name: str) -> str:
 def _content_lines(src: str | None, template: str | None) -> list[str] | None:
     """Markdown text lines as they would actually RENDER for this template.
 
-    graph/full slides are text-free (only the image renders), so markdown body
-    text on them can never reach the deck — comparing it against the live slide
-    would report drift forever. The equation template drops its `# h1` (only
-    the `##` kicker renders), so that heading is removed from the comparison
-    for the same reason. A ```gslides-overlay``` block renders on ANY template,
-    so its insertText lines count as visible (and its raw JSON does not).
+    graph/full slides are text-free apart from the image, the optional
+    link-only footer line, and any overlay — other markdown body text never
+    reaches the deck, so comparing it against the live slide would report
+    drift forever. The equation template drops its `# h1` (only the `##`
+    kicker renders), so that heading is removed from the comparison for the
+    same reason. A ```gslides-overlay``` block renders on ANY template, so its
+    insertText lines count as visible (and its raw JSON does not).
     """
     if src is None:
         return None
     overlay, src = _extract_overlay(src)
     tpl = (template or "").lower()
     if tpl in ("graph", "full"):
-        return _norm_lines(_overlay_texts(overlay))
+        _h, paras, *_ = parse_body(VERBATIM_RE.sub("", src))
+        links = [p.text for p in paras if p.text and _link_only_para(p)][:1]
+        return _norm_lines(links + _overlay_texts(overlay))
     lines = text_lines_md(src)
     if tpl == "equation":
         headings, *_ = parse_body(VERBATIM_RE.sub("", src))
