@@ -1,6 +1,6 @@
 [project]
 name = "slidesync"
-version = "0.11.0"
+version = "0.11.1"
 authors = [
     { name = "Daniel Hails", email = "slidesync@hails.info" },
 ]
@@ -32,7 +32,7 @@ include = ["slidesync*"]
 dev = ["pytest>=8"]
 
 [tool.bumpver]
-current_version = "0.11.0"
+current_version = "0.11.1"
 version_pattern = "MAJOR.MINOR.PATCH"
 commit_message = "bump version {old_version} -> {new_version}"
 commit = true
