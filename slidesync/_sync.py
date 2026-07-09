@@ -924,15 +924,17 @@ STYLES = {
 }
 
 
-def _est_lines(text: str, pt: int, width_in: float = 9.32) -> int:
-    """Estimate wrapped line count for a bold headline (font-metric free).
+def _est_lines(text: str, pt: int, width_in: float = 9.32,
+               glyph_w: float = 0.64) -> int:
+    """Estimate wrapped line count for a heading (font-metric free).
 
-    The 0.64 average-glyph-width factor is measured from IBM Plex Bold and is
-    deliberately conservative: it slightly over-counts lines so the reserved
-    headline height never falls short of what renders (which would overlap the
-    body below it).
+    The default 0.64 average-glyph-width factor is measured from IBM Plex Bold
+    (headlines) and is deliberately conservative: it slightly over-counts lines
+    so the reserved height never falls short of what renders (which would
+    overlap the element below it). The regular-weight all-caps kicker measures
+    ~0.556; its callers pass 0.58 so a one-line kicker isn't misread as two.
     """
-    chars_per_line = max(1, int(width_in * 72 / (pt * 0.64)))
+    chars_per_line = max(1, int(width_in * 72 / (pt * glyph_w)))
     return max(1, math.ceil(len(text) / chars_per_line))
 
 
@@ -1131,6 +1133,11 @@ def _styled_requests(slide: Slide, style: Style, image_url, image_px,
         head_pt = _fit_headline_pt(headline_text, style.headline_pt,
                                    max_lines=style.head_lines)
         head_h = _est_lines(headline_text, head_pt) * head_pt * 1.25 / 72 + 0.1
+    # A long kicker wraps: reserve its true height so it never overlaps the
+    # headline. One line is ~0.31in at 18pt; the legacy single-line numbers
+    # (0.5in box, 0.36 advance) are reproduced exactly by text_h + 0.19/0.05.
+    kick_lines = (_est_lines(kicker_text, 18, glyph_w=0.58) if kicker_text else 0)
+    kick_text_h = kick_lines * 18 * 1.25 / 72
     # Title cards have no body region; body lines render as a small dimmed
     # byline beneath the headline (e.g. "Project · Presenter" on a title slide).
     byline = ""
@@ -1139,7 +1146,8 @@ def _styled_requests(slide: Slide, style: Style, image_url, image_px,
     by_h = (byline.count("\n") + 1) * 0.32 if byline else 0.0
     # Title cards (no body, no image) vertically centre kicker+headline+byline.
     if (style.body_align is None or not slide.paras) and not slide.image:
-        block = (0.36 if kicker_text else 0) + head_h + (by_h + 0.1 if byline else 0)
+        block = ((kick_text_h + 0.05 if kicker_text else 0) + head_h
+                 + (by_h + 0.1 if byline else 0))
         y = max(0.4, (5.63 - block) / 2)
     else:
         y = style.top
@@ -1147,9 +1155,9 @@ def _styled_requests(slide: Slide, style: Style, image_url, image_px,
     # centred for centred-body templates (question/label) and title cards.
     head_align = "START" if style.body_align == "START" else "CENTER"
     if kicker_text:
-        reqs += _text_box(sid, sid + "_k", (0.34, y, 9.32, 0.5),
+        reqs += _text_box(sid, sid + "_k", (0.34, y, 9.32, kick_text_h + 0.19),
                           kicker_text, 18, RED, False, halign=head_align)
-        y += 0.36  # tight kicker -> headline gap (kicker text is ~0.31in tall)
+        y += kick_text_h + 0.05  # tight kicker -> headline gap
     if headline_text:
         reqs += _text_box(sid, sid + "_h", (0.34, y, 9.32, head_h),
                           headline_text, head_pt, style.headline_rgb, True,
