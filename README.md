@@ -199,6 +199,17 @@ requests (use `__PAGE__` for the slide page id). Sync is **pull-authoritative /
 push-if-missing**: the Slides copy is the source of truth — `push` only creates
 the slide when missing, `pull` captures the live drawing back into the block.
 
+### Template-slot validation
+
+`push`/`sync` refuse up front when a slide carries content its template has no
+slot for (it would render as nothing, silently): a heading, table, or prose
+paragraph on a text-free `graph`/`full` slide; an `# h1` alongside the kicker
+on an `equation` slide; an image/table on `prompt`/`code`; an image on
+`equation`. Each violation names the slide and the fix — usually moving the
+content into a `<!-- comment -->`, which becomes speaker notes. Link-only
+paragraphs on text-free templates are exempt (the crop → full-figure
+trace-link convention).
+
 ### Overlays — raw requests on top of a templated slide
 
 A ```` ```gslides-overlay ```` block rides on a **normal templated/generative

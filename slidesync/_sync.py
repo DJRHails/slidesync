@@ -1378,6 +1378,72 @@ def _warn_dropped_equations(slide: Slide, where: str) -> None:
                        f"{where} slides have no equation region")
 
 
+def _link_only_para(p: Para) -> bool:
+    """A paragraph that is nothing but links and separators (the crop →
+    full-figure trace-link convention) — markdown-side navigation with nothing
+    the slide is expected to render."""
+    covered = [False] * len(p.text)
+    for r in p.runs:
+        if r.style == "link":
+            for i in range(r.start, min(r.end, len(p.text))):
+                covered[i] = True
+    outside = "".join(c for i, c in enumerate(p.text) if not covered[i])
+    return bool(p.runs) and not re.sub(r"[\s·|/,;&+–—-]", "", outside)
+
+
+def validate_slots(slides: list[Slide]) -> list[str]:
+    """Authored content a slide's template has no slot for, one entry each.
+
+    A mismatch is content the render silently DROPS — a headline or prose
+    caption on a text-free `graph`/`full` template, an `# h1` on an `equation`
+    slide (only the `##` kicker renders), an image on a `prompt`/`code` or
+    `equation` slide. Callers fail the push up front rather than publish a
+    deck missing what the author wrote. Exempt: link-only paragraphs on
+    text-free templates (the trace-link convention) and comments (they become
+    speaker notes everywhere).
+    """
+    out: list[str] = []
+
+    def bad(slide: Slide, what: str, fix: str) -> None:
+        out.append(f"'{slide.key}' (template: {slide.template_name}): "
+                   f"{what} — {fix}")
+
+    for s in slides:
+        if s.custom is not None:
+            continue
+        tpl = (s.template_name or "").lower()
+        if tpl in ("graph", "full"):
+            if s.title or s.kicker:
+                bad(s, f"heading {(s.title or s.kicker)[:60]!r} never renders "
+                       "(text-free template)",
+                    "drop it, move it into a <!-- comment --> (speaker notes), "
+                    "or use a template with a text slot (e.g. topic)")
+            if s.table:
+                bad(s, "a table never renders (text-free template)",
+                    "move it to a content/topic slide")
+            prose = [p for p in s.paras if p.text and not _link_only_para(p)]
+            if prose:
+                bad(s, f"body text {prose[0].text[:60]!r} never renders "
+                       "(text-free template; link-only lines are exempt)",
+                    "move it into a <!-- comment --> (speaker notes)")
+        elif tpl == "equation":
+            if s.title and s.kicker:
+                bad(s, f"`# {s.title[:60]}` never renders (only the `##` "
+                       "kicker does)",
+                    "fold it into the `##` line or a comment")
+            if s.image:
+                bad(s, "an image never renders on an equation slide",
+                    "move it to a graph slide")
+        elif tpl in ("prompt", "code"):
+            if s.image:
+                bad(s, "an image never renders on a prompt/code slide",
+                    "move it to a graph slide")
+            if s.table:
+                bad(s, "a table never renders on a prompt/code slide",
+                    "move it to a content slide")
+    return out
+
+
 def slide_requests(slide: Slide, image_url, image_px,
                    layouts=None, templates=None, equations=()) -> list[dict]:
     """Full request list for one slide: its template/generative render, plus any
@@ -2833,10 +2899,21 @@ def _deck_of(args, paths: list[Path]) -> str | None:
     return None
 
 
+def _exit_on_slot_mismatches(source: list[Slide]) -> None:
+    problems = validate_slots(source)
+    if not problems:
+        return
+    for p in problems:
+        logger.error(f"[slot] {p}")
+    sys.exit(f"{len(problems)} template-slot mismatch(es) above — authored "
+             "content the template would silently drop; nothing pushed")
+
+
 def cmd_push(args):
     paths = _source_paths(args)
     source = load_deck(paths)
     logger.info(f"parsed {len(source)} slides from {len(paths)} file(s)")
+    _exit_on_slot_mismatches(source)
     slides_api, drive = get_services(args.account)
     deck = _deck_of(args, paths)
     if args.new:
@@ -3213,6 +3290,7 @@ def cmd_sync(args):
     slides_api, drive = get_services(args.account)
     paths = _source_paths(args)
     source = load_deck(paths)
+    _exit_on_slot_mismatches(source)
     deck = _deck_of(args, paths)
     if not deck:
         sys.exit("no target deck: pass --deck or add `deck:` frontmatter")

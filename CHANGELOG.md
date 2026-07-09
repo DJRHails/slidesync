@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.12.0
+
+### Template-slot validation — dropped content now fails the push
+
+`push` and `sync` refuse up front (before any API call) when a slide carries
+content its template has no slot for — content that previously rendered as
+NOTHING, silently: a heading, table, or prose paragraph on a text-free
+`graph`/`full` template; an `# h1` alongside the `##` kicker on an `equation`
+slide; an image or table on a `prompt`/`code` slide; an image on an
+`equation` slide. Every violation is listed with the slide key and a fix
+(usually: move it into a `<!-- comment -->`, which becomes speaker notes).
+Exempt: link-only paragraphs on text-free templates (the crop → full-figure
+trace-link convention) and comments. Breaking in the sense that previously
+tolerated (silently lossy) decks now exit 1 until cleaned — hence the minor
+bump.
+
 ## 0.11.2
 
 ### Linked images — `[![alt](img)](href)`

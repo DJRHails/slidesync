@@ -450,10 +450,12 @@ Maximise reward under the monitor budget.
 """
 
 
-def test_equation_slides_with_a_dropped_h1_stay_clean(tmp_path, monkeypatch):
-    # The equation template renders only the kicker + equation + caption; the
-    # `# h1` is parsed but never reaches the deck, so it must not register as
-    # live-drift (the graph/full regression, replayed for `template: equation`).
+def test_equation_slide_with_h1_fails_sync_up_front(tmp_path, monkeypatch):
+    # The equation template renders only the kicker + equation + caption; an
+    # `# h1` alongside the kicker never reaches the deck. That used to be
+    # tolerated silently (drift kept clean via _content_lines); slot
+    # validation now refuses it at the CLI layer before any API call — the
+    # direct push() API still accepts it for live decks pushed historically.
     store, drive = FakeStore(), FakeDrive()
     slides_api = FakeSlides(store)
     monkeypatch.setattr(_sync, "get_services", lambda account: (slides_api, drive))
@@ -469,8 +471,10 @@ def test_equation_slides_with_a_dropped_h1_stay_clean(tmp_path, monkeypatch):
     assert "THE OBJECTIVE" in live and "Maximise reward" in live
     assert "Headline parsed but never rendered" not in live
     before = path.read_text()
-    cmd_sync(SimpleNamespace(source=path, deck=DECK, account=None, prune=False, allow_rekey=False))
-    assert path.read_text() == before  # no write-back, no conflict, no churn
+    with pytest.raises(SystemExit, match="slot mismatch"):
+        cmd_sync(SimpleNamespace(source=path, deck=DECK, account=None,
+                                 prune=False, allow_rekey=False))
+    assert path.read_text() == before  # refused up front: nothing touched
 
 
 WEEK_A = """---
