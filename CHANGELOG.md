@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.15.0
+
+### Template inference is now the default
+
+`infer: true` in the file-level frontmatter is no longer needed — every file
+gets 0.14's shape-based `template:` inference unless it opts out with
+`infer: false`. An explicit `infer: true` remains a harmless no-op, so
+existing decks are unaffected. Everything else about inference is unchanged:
+explicit `template:`/`layout:` still wins, tables and mermaid-only slides
+stay untagged, and the content hash still carries the *effective* template.
+Behaviour change to watch: a previously untagged file that relied on
+unstyled slides now gets inferred templates on its next push — add
+`infer: false` to keep the old rendering.
+
 ## 0.14.0
 
 ### Less boilerplate — inferred `template:` and derived `id:`

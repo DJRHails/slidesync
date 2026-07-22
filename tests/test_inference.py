@@ -1,11 +1,12 @@
-"""Template inference (`infer: true`) and derived slide ids — no network/auth.
+"""Template inference (on by default, `infer: false` opts out) and derived
+slide ids — no network/auth.
 
-Template inference is opt-in per file: with `infer: true` in the file-level
-frontmatter, untagged slides get a `template:` from their shape (first slide
--> dark title card, `##`-over-`#` -> dark divider, `#` headline -> topic,
-lone `##` -> content, lone figure -> graph, fenced block -> prompt). Id
-derivation is always on: an id-less slide is keyed by its `#` headline slug,
-else its `##` title slug, else its figure filename stem.
+Template inference is the default: untagged slides get a `template:` from
+their shape (first slide -> dark title card, `##`-over-`#` -> dark divider,
+`#` headline -> topic, lone `##` -> content, lone figure -> graph, fenced
+block -> prompt); a file opts out with `infer: false` in its file-level
+frontmatter. Id derivation is always on: an id-less slide is keyed by its
+`#` headline slug, else its `##` title slug, else its figure filename stem.
 """
 
 import pytest
@@ -79,7 +80,8 @@ def _keyed(md):
 
 def test_infer_flag_reads_file_frontmatter():
     assert _file_infer(INFER_DECK)
-    assert not _file_infer(INFER_DECK.replace("infer: true\n", ""))
+    assert _file_infer(INFER_DECK.replace("infer: true\n", ""))  # on by default
+    assert not _file_infer(INFER_DECK.replace("infer: true\n", "infer: false\n"))
 
 
 def test_inferred_templates_by_shape():
@@ -146,7 +148,9 @@ def test_multi_file_namespacing_and_links_use_derived_ids(tmp_path):
         "## PRIMARY WORK\n# CROSS-FIRES\n")
     other = tmp_path / "2026-07-16.slidev.md"
     other.write_text("---\n---\n# Old Title\n")
-    slides = load_deck([deck, other])
+    optout = tmp_path / "2026-07-09.slidev.md"
+    optout.write_text("---\ninfer: false\n---\n\n---\n---\n# Older Title\n")
+    slides = load_deck([deck, other, optout])
     keys = [s.key for s in slides]
     assert "2026-07-23-cross-fires" in keys
     assert "2026-07-16-old-title" in keys
@@ -156,7 +160,9 @@ def test_multi_file_namespacing_and_links_use_derived_ids(tmp_path):
     divider = next(s for s in slides if s.key == "2026-07-23-cross-fires")
     assert divider.template_name == "dark"
     old = next(s for s in slides if s.key == "2026-07-16-old-title")
-    assert old.template_name is None  # that file never opted in
+    assert old.template_name == "dark"  # inference is the default per file
+    older = next(s for s in slides if s.key == "2026-07-09-older-title")
+    assert older.template_name is None  # infer: false opts a file out
 
 
 def test_duplicate_derived_ids_are_rejected(tmp_path):
