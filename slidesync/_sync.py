@@ -470,8 +470,10 @@ def _parse_yaml(text: str) -> dict:
 
 
 def _file_infer(text: str) -> bool:
-    """Whether the file-level frontmatter opts into template inference (`infer: true`)."""
-    return _is_truthy(frontmatter.loads(text).metadata.get("infer"))
+    """Template inference is on by default; `infer: false` in the file-level
+    frontmatter opts a file out (an explicit `infer: true` remains a no-op)."""
+    val = frontmatter.loads(text).metadata.get("infer")
+    return True if val is None else _is_truthy(val)
 
 
 _FENCED_RE = re.compile(

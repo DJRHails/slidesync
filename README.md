@@ -133,8 +133,8 @@ each slide may have its own frontmatter (`id:`, `template:`, `layout:`,
   comment capture / live-edit write-back anchor into id-less slides the same
   way. Duplicate ids — derived or explicit — fail the push; give one slide an
   explicit `id:` to break the tie.
-- **Template inference (opt-in):** with `infer: true` in the file-level
-  frontmatter, an untagged slide gets its `template:` from its shape — the
+- **Template inference (default; `infer: false` opts a file out):** an
+  untagged slide gets its `template:` from its shape — the
   first slide of a file is the `dark` title card; a `##` kicker above the `#`
   headline is a `dark` section divider; an `#` headline is a `topic`; a lone
   `##` title is `content`; a figure with no headings is a `graph`; a fenced
