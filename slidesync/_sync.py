@@ -1620,19 +1620,24 @@ def _templated_requests(slide: Slide, image_url, image_px,
         _warn_dropped_equations(slide, "themed-layout")
         return _layout_requests(slide, layouts[name])
     tid = slide.object_id + "_t"
+    # Styling an empty TITLE box is a Slides API 400 ("The object ... has no
+    # text"), and _insert skips empty text — so every title style below is
+    # gated on the title actually existing.
+    title_style = _title_style_gate(slide.title)
     if slide.layout == "section":
         reqs = _create(slide, "TITLE", [("CENTERED_TITLE", tid)])
         reqs += _insert(tid, slide.title)
-        reqs += [_bg(slide.object_id, DARK_BG), _font_all(tid, PAPER, bold=True)]
+        reqs += [_bg(slide.object_id, DARK_BG)]
+        reqs += title_style([_font_all(tid, PAPER, bold=True)])
     elif slide.layout == "content":
         bid = slide.object_id + "_b"
         reqs = _create(slide, "TITLE_AND_BODY", [("TITLE", tid), ("BODY", bid)])
         reqs += _insert(tid, slide.title) + _body(bid, slide.paras)
-        reqs += [_bg(slide.object_id, LIGHT_BG)] + _kicker(tid)
+        reqs += [_bg(slide.object_id, LIGHT_BG)] + title_style(_kicker(tid))
     else:
         reqs = _create(slide, "TITLE_ONLY", [("TITLE", tid)])
         reqs += _insert(tid, slide.title)
-        reqs += [_bg(slide.object_id, LIGHT_BG)] + _kicker(tid)
+        reqs += [_bg(slide.object_id, LIGHT_BG)] + title_style(_kicker(tid))
         if slide.layout == "image" and image_url:
             reqs.append(_image(slide, image_url, image_px))
             reqs += _image_meta_reqs(slide.object_id + "_img", slide)
@@ -1646,6 +1651,18 @@ def _templated_requests(slide: Slide, image_url, image_px,
         reqs += _equation_requests(slide.object_id, equations, top_in=top,
                                    bottom_in=bottom, x_in=body_x, width_in=body_w)
     return reqs
+
+
+def _title_style_gate(title: str):
+    """Requests pass through only when the slide has a title to style.
+
+    A style request against an empty text box 400s the whole batchUpdate,
+    so title-less slides (comment-only placeholders, bare equations,
+    bullets-only bodies) must skip their title styling entirely.
+    """
+    def gate(reqs: list[dict]) -> list[dict]:
+        return reqs if title else []
+    return gate
 
 
 def _plain_body(paras: list[Para]) -> str:

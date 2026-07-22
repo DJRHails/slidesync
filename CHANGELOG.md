@@ -2,6 +2,15 @@
 
 ## 0.15.0
 
+### Title-less slides no longer abort the push
+
+A slide with no `#`/`##` heading (a comment-only placeholder, a bare `$$`
+equation, a bullets-only body) used to emit `updateTextStyle` against its
+empty TITLE box — the Slides API rejects that with "The object (…_t) has no
+text" and the **whole batchUpdate aborts**, killing the push for every slide.
+Title styling (kicker, section font) is now gated on the title existing;
+`_insert` already skipped the empty insert.
+
 ### Template inference is now the default
 
 `infer: true` in the file-level frontmatter is no longer needed — every file
