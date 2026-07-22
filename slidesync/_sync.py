@@ -15,8 +15,9 @@ carries the `slides`+`drive` scopes.
 Idempotent sync (upsert), never a blind append:
 
 - Each managed slide is created with `objectId = s2g_<keyHash>_<contentHash>`.
-- `keyHash` identifies *which* slide (per-slide `id:` frontmatter, else a title
-  slug, else index) and survives edits/reorders; `contentHash` is over a
+- `keyHash` identifies *which* slide (per-slide `id:` frontmatter, else the
+  `#` headline slug, else the `##` title slug, else the figure filename stem,
+  else index) and survives edits/reorders; `contentHash` is over a
   canonical render, so push->pull->push is a no-op.
 - Diff: identical hash -> skip; same key, new content -> replace; new key ->
   create. Removed slides are kept by default (`--prune` to delete).
@@ -61,7 +62,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TypedDict
+from typing import NamedTuple, TypedDict
 
 import frontmatter
 from google.auth.transport.requests import Request
@@ -373,7 +374,8 @@ INLINE_RE = re.compile(
 
 
 def load_slides(path: Path) -> list[Slide]:
-    slides = build_slides(split_slides(path.read_text()))
+    text = path.read_text()
+    slides = build_slides(split_slides(text), infer=_file_infer(text))
     for s in slides:
         # Record the origin and re-finalize now that it's known, so a relative
         # `![](fig.png)` resolves against this file's dir and its bytes fold into
@@ -409,17 +411,22 @@ def load_deck(paths: list[Path]) -> list[Slide]:
         slides = []
         for path in paths:
             prefix = path.name.split(".")[0]
-            chunks = split_slides(path.read_text())
-            local = {m.get("id") or f"slide{i}" for i, (m, _b) in enumerate(chunks)}
+            text = path.read_text()
+            infer = _file_infer(text)
+            chunks = split_slides(text)
+            keys = [m.get("id") or _derive_key(b) or f"slide{i}"
+                    for i, (m, b) in enumerate(chunks)]
+            local = set(keys)
 
             def relink(m, prefix=prefix, local=local):
                 t = m.group("target")
                 return f"](#{prefix}-{t})" if t in local else m.group(0)
 
             for i, (meta, body) in enumerate(chunks):
-                src_key = meta.get("id") or f"slide{i}"
+                src_key = keys[i]
                 meta = {**meta, "id": f"{prefix}-{src_key}"}
-                slide = build_slide(meta, LOCAL_LINK_RE.sub(relink, body), i)
+                slide = build_slide(meta, LOCAL_LINK_RE.sub(relink, body), i,
+                                    infer=infer)
                 slide.src_path, slide.src_key = path, src_key
                 _finalize(slide, path.parent)  # fold image bytes now src_path is set
                 slides.append(slide)
@@ -462,30 +469,126 @@ def _parse_yaml(text: str) -> dict:
     return out
 
 
-def build_slides(chunks: list[tuple[dict, str]]) -> list[Slide]:
-    return [build_slide(meta, body, i) for i, (meta, body) in enumerate(chunks)]
+def _file_infer(text: str) -> bool:
+    """Whether the file-level frontmatter opts into template inference (`infer: true`)."""
+    return _is_truthy(frontmatter.loads(text).metadata.get("infer"))
 
 
-def build_slide(meta: dict, body: str, index: int) -> Slide:
+_FENCED_RE = re.compile(
+    r"""(?msx)               # multiline, dotall, verbose
+    ^```(?P<info>[^\n]*)\n   # opening fence with its info string
+    .*?                      # literal block body
+    \n```[ \t]*$             # closing fence
+    """
+)
+
+
+class _Skim(NamedTuple):
+    """Structural skim of a slide body — just enough for template/id inference."""
+
+    levels: list[int]         # h1/h2 levels in authored order (leading block only)
+    headings: dict[int, str]  # first h1 / first h2 text
+    image: str                # first image url ("" when none)
+    table: bool               # any markdown table
+    fences: list[str]         # fenced-block info strings (```info)
+
+
+def _skim(body: str) -> _Skim:
+    """Skim a slide body the way `parse_body` reads it: comments, fenced blocks
+    and `$$` equations are invisible, `#`/`##` headings count only until the
+    first body paragraph, and only the first image matters."""
+    text = COMMENT_RE.sub("", body)
+    fences = [m.group("info").strip() for m in _FENCED_RE.finditer(text)]
+    text = EQUATION_RE.sub("", _FENCED_RE.sub("", text))
+    levels: list[int] = []
+    headings: dict[int, str] = {}
+    image, table, leading = "", False, True
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        hm = HEADING_RE.match(line)
+        if hm and len(hm.group(1)) in (1, 2) and len(hm.group(1)) not in headings and leading:
+            levels.append(len(hm.group(1)))
+            headings[len(hm.group(1))] = hm.group(2).strip()
+            continue
+        if im := (LINKED_IMAGE_RE.match(stripped) or IMAGE_RE.match(stripped)):
+            image = image or im.group("url")
+            continue
+        if "|" in line and i + 1 < len(lines) and TABLE_SEP_RE.match(lines[i + 1]):
+            table = True
+            continue
+        leading = False  # a body paragraph ends the heading block
+    return _Skim(levels, headings, image, table, fences)
+
+
+def _derive_key(body: str) -> str:
+    """Implicit slide id: the `#` headline slug, else the `##` title slug, else
+    the figure filename stem (with a `_deck` variant suffix stripped)."""
+    sk = _skim(body)
+    if slug := _slug(sk.headings.get(1) or sk.headings.get(2) or ""):
+        return slug
+    stem = sk.image.rsplit("/", 1)[-1].rsplit(".", 1)[0] if sk.image else ""
+    return _slug(re.sub(r"_deck$", "", stem))
+
+
+def _infer_template(body: str, index: int) -> str | None:
+    """Default `template:` for an untagged slide, from its shape alone.
+
+    The first slide of a file is its title card (`dark`). A fenced block is a
+    verbatim `prompt`; a figure with no headings is a self-titled `graph`; a
+    `##` kicker above the `#` headline is a `dark` section divider; an `#`
+    headline is a `topic`; a lone `##` title is `content`. Slides with tables
+    or only a mermaid block stay untagged — the styled templates have no slot
+    for them, the generative layouts do.
+    """
+    if index == 0:
+        return "dark"
+    sk = _skim(body)
+    if sk.table:
+        return None
+    if any(info != "mermaid" for info in sk.fences):
+        return "prompt"
+    if sk.image and not sk.levels:
+        return "graph"
+    if sk.levels[:2] == [2, 1]:
+        return "dark"
+    if 1 in sk.levels:
+        return "topic"
+    if 2 in sk.levels:
+        return "content"
+    return None
+
+
+def build_slides(chunks: list[tuple[dict, str]], infer: bool = False) -> list[Slide]:
+    return [build_slide(meta, body, i, infer=infer)
+            for i, (meta, body) in enumerate(chunks)]
+
+
+def build_slide(meta: dict, body: str, index: int, infer: bool = False) -> Slide:
     authored = body.strip("\n")
     # overlay first: VERBATIM_RE (prompt/code) grabs whichever fence comes first
     # in the body, so the overlay block must already be gone by then
     overlay, body = _extract_overlay(body)
     custom, body = _extract_custom(body)
+    template = meta.get("template")
+    if infer and not template and custom is None and not meta.get("layout"):
+        template = _infer_template(body, index)
     verbatim = None
-    if (meta.get("template") or "").lower() in ("prompt", "code"):
+    if (template or "").lower() in ("prompt", "code"):
         verbatim, body = _extract_verbatim(body)
     (headings, paras, image, image_alt, mermaid, table, notes, equations,
      image_link) = parse_body(body)
     h1, h2 = headings.get(1), headings.get(2)
     title = h1 or h2 or ""           # h1 is the headline; a lone h2 is the title
     kicker = h2 if (h1 and h2) else ""  # an h2 above an h1 is the kicker
-    key = meta.get("id") or _slug(title) or f"slide{index}"
+    key = meta.get("id") or _derive_key(authored) or f"slide{index}"
     slide = Slide(key, _layout_of(meta, image or mermaid, table), title, paras,
                   image, image_alt, image_link, mermaid, table, notes, equations)
     slide.kicker = kicker
     slide.layout_name = meta.get("layout")
-    slide.template_name = "custom" if custom is not None else meta.get("template")
+    slide.template_name = "custom" if custom is not None else template
     slide.vars = {k: v for k, v in meta.items() if k not in RESERVED_KEYS}
     slide.custom = custom
     if custom is not None and overlay is not None:
@@ -3287,16 +3390,42 @@ def _render_body(slide: Slide) -> str:
 _SEP_RE = re.compile(r"(?m)^---[ \t]*$")
 
 
+def _slide_chunks(text: str) -> list[tuple[dict, int, int]]:
+    """`split_slides` with offsets — (frontmatter, body_start, body_end) per slide."""
+    bounds, pos = [], 0
+    for m in _SEP_RE.finditer(text):
+        bounds.append((pos, m.start()))
+        pos = m.end()
+    bounds.append((pos, len(text)))
+    out, i = [], 0
+    while i < len(bounds):
+        meta, (start, end) = {}, bounds[i]
+        chunk = text[start:end]
+        if i + 1 < len(bounds) and _is_yaml_block(chunk):
+            meta = _parse_yaml(chunk)
+            i += 1
+            start, end = bounds[i]
+            chunk = text[start:end]
+        if chunk.strip():
+            out.append((meta, start, end))
+        i += 1
+    return out
+
+
 def _slide_span(text: str, key: str) -> tuple[int, int] | None:
-    """(start, end) of the body of the slide whose frontmatter id is `key`."""
+    """(start, end) of the body of the slide whose id is `key` — explicit `id:`
+    frontmatter, else the derived id (`_derive_key`) of an id-less slide."""
     m = re.search(rf"(?m)^id:\s*{re.escape(key)}\s*$", text)
-    if not m:
-        return None  # slide has no id: frontmatter — can't anchor file surgery
-    closer = _SEP_RE.search(text, m.end())
-    if not closer:
-        return None
-    nxt = _SEP_RE.search(text, closer.end())
-    return closer.end(), nxt.start() if nxt else len(text)
+    if m:
+        closer = _SEP_RE.search(text, m.end())
+        if not closer:
+            return None
+        nxt = _SEP_RE.search(text, closer.end())
+        return closer.end(), nxt.start() if nxt else len(text)
+    for meta, start, end in _slide_chunks(text):
+        if not meta.get("id") and _derive_key(text[start:end]) == key:
+            return start, end
+    return None
 
 
 def _replace_slide_body(text: str, key: str, body: str) -> str:

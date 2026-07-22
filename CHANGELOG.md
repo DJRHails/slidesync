@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.14.0
+
+### Less boilerplate — inferred `template:` and derived `id:`
+
+Per-slide frontmatter is now fully optional. **Derived ids (always on):** a
+slide without `id:` is keyed by its `#` headline slug, else its `##` title
+slug, else its figure filename stem (`_deck` variant suffix stripped), else
+its index — in multi-file decks too (previously id-less slides fell back to
+the positional `slide{i}`, so their keys churned on reorder). Intra-file
+`[text](#derived-id)` links resolve against derived ids, comment capture and
+live-edit write-back can anchor into id-less slides, and duplicate ids —
+derived or explicit — still fail the push. **Template inference (opt-in via
+`infer: true` in the file-level frontmatter):** an untagged slide gets its
+`template:` from its shape — first slide of a file → `dark` title card, `##`
+kicker above the `#` headline → `dark` section divider, `#` headline →
+`topic`, lone `##` title → `content`, figure with no headings → `graph`,
+fenced block → `prompt`. Explicit `template:`/`layout:` always wins; tables
+and mermaid-only slides stay untagged (the styled templates have no slot for
+them). The content hash carries the *effective* template, so stripping a
+`template:` line that matches inference is a no-op push; stripping an `id:`
+re-keys the slide (the sync marker-id fallback still matches the live copy
+once, but links and threads should keep load-bearing ids explicit).
+Re-key caveat: an id-less slide that previously fell back to a positional
+key (`slide{i}`) or has no headings but an image now derives a different
+key, so such slides re-push once under the new id.
+
 ## 0.13.0
 
 ### Graph-slide link footer

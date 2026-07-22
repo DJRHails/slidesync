@@ -121,10 +121,28 @@ comments in place).
 
 ## Markdown dialect
 
-Top-level frontmatter: `theme:`, `deck:`. Slides separated by `---`; each slide
-may have its own frontmatter (`id:`, `template:`, `layout:`, `hidden:`).
+Top-level frontmatter: `theme:`, `deck:`, `infer:`. Slides separated by `---`;
+each slide may have its own frontmatter (`id:`, `template:`, `layout:`,
+`hidden:`) — all of it optional.
 
 - `# h1` = headline, `## h2` above an `# h1` = kicker; a lone `##` is the title.
+- **Derived ids (always on):** a slide without `id:` frontmatter is keyed by
+  its `#` headline slug, else its `##` title slug, else its figure filename
+  stem (a `_deck` variant suffix is stripped), else its index. Internal links
+  target the derived id (`[back](#cross-fires)` for `# CROSS-FIRES`), and
+  comment capture / live-edit write-back anchor into id-less slides the same
+  way. Duplicate ids — derived or explicit — fail the push; give one slide an
+  explicit `id:` to break the tie.
+- **Template inference (opt-in):** with `infer: true` in the file-level
+  frontmatter, an untagged slide gets its `template:` from its shape — the
+  first slide of a file is the `dark` title card; a `##` kicker above the `#`
+  headline is a `dark` section divider; an `#` headline is a `topic`; a lone
+  `##` title is `content`; a figure with no headings is a `graph`; a fenced
+  block is a `prompt`. Explicit `template:` / `layout:` always wins; slides
+  with tables or only a mermaid block stay untagged (the styled templates
+  have no slot for them). The content hash carries the *effective* template,
+  so deleting a `template:` line that matches what inference picks is a
+  no-op push.
 - **Hidden slides:** `hidden: true` (or `hide: true`) marks a slide **skipped**
   in the presentation — still a native, editable slide, just hidden in present
   mode (via the Slides API's `isSkipped`), the analogue of Slidev's `hidden`
