@@ -8,9 +8,9 @@ It exists so a talk can be written and versioned as markdown while still ending
 up as an ordinary, editable Google Slides deck that collaborators comment on and
 tweak, with those comments and edits flowing back into the markdown. **Status:
 working tool, single maintainer, published on PyPI.** 73 commits between
-2026-06-10 and 2026-07-22; no commits since (from `git log`). The built-in brand
-kit is one specific house style (IBM Plex, red kicker), so the styled templates
-suit the author's decks more than anyone else's.
+2026-06-10 and 2026-07-22, then none until this README audit (from `git log`).
+The built-in brand kit is one specific house style (IBM Plex, red kicker), so
+the styled templates suit the author's decks more than anyone else's.
 
 Version: 0.15.0
 
@@ -58,10 +58,9 @@ What the project's value rests on: the stable object-id scheme plus the hidden
 `CHANGELOG.md` (0.10.4, "Id-scheme stability") treats that scheme as a
 compatibility contract with every existing deck.
 
-Confidence tags are an assessment of the evidence in this repo (sample sizes,
-seeds, intervals), added in a 2026-10 README audit; they are not new
-measurements. Here "evidence" means the offline test suite and the changelog
-rather than samples or seeds.
+Confidence tags were added in a 2026-10 README audit. They are a judgement of
+the evidence already in this repo (the offline test suite, whether a code path
+has a test, and the field reports in `CHANGELOG.md`), not new measurements.
 
 **Contents:** [Why](#why) · [Auth](#auth-no-setup) · [Commands](#commands) ·
 [Idempotent sync](#idempotent-sync-upsert) · [Sync & drift](#sync--drift) ·
