@@ -4,12 +4,72 @@ Bidirectional sync between a [Slidev](https://sli.dev) markdown deck and **Googl
 Slides** — as native, editable objects (title/body/bullets/tables/positioned
 images, brand-styled text boxes), not pasted screenshots.
 
-Version: 0.14.0
+It exists so a talk can be written and versioned as markdown while still ending
+up as an ordinary, editable Google Slides deck that collaborators comment on and
+tweak, with those comments and edits flowing back into the markdown. **Status:
+working tool, single maintainer, published on PyPI.** 73 commits between
+2026-06-10 and 2026-07-22; no commits since (from `git log`). The built-in brand
+kit is one specific house style (IBM Plex, red kicker), so the styled templates
+suit the author's decks more than anyone else's.
+
+Version: 0.15.0
+
+(That is the version on `main`; PyPI can lag until the next tag, see
+[History and provenance](#history-and-provenance).)
 
 ```bash
 uvx slidesync --help            # run without installing
 pip install slidesync           # or install the CLI + library
 ```
+
+### Key takeaways
+
+- **Push, pull and sync work on native Slides objects, and push→pull→push is a
+  no-op** (unchanged content hashes are skipped). See
+  [Idempotent sync](#idempotent-sync-upsert).
+  [confidence: ~85%; 181 offline tests pass, including 29 end-to-end cases
+  against an in-memory Slides/Drive fake (`tests/test_e2e_scenarios.py`). Live
+  API behaviour rests on the `roundtrip` self-test and the author's own decks,
+  not on CI]
+- **A push does not silently overwrite edits made in Google Slides.** It is
+  rejected like a non-fast-forward git push, and a push that would re-key a
+  deck's worth of slides is refused even with `--force`. See
+  [Sync & drift](#sync--drift). [confidence: ~85%; covered by
+  `tests/test_rekey_guard.py` and the e2e scenarios. The re-key guard was added
+  after a real sync recreated all 391 managed slides of a live deck and wiped
+  live highlights (`CHANGELOG.md`, 0.10.4)]
+- **Only slides slidesync created are ever touched.** Managed slides carry an
+  `s2g_<keyHash>_<contentHash>` object id; hand-authored slides are invisible to
+  it. See [Idempotent sync](#idempotent-sync-upsert). [confidence: ~90%;
+  enforced by one regex (`MANAGED_RE` in `slidesync/_sync.py`)]
+- **No separate OAuth setup, but you need the `gog` CLI.** Credentials are
+  borrowed from gog on macOS or Linux. See [Auth](#auth-no-setup).
+  [confidence: ~80% on macOS; ~65% on Linux, where the credential lookup was
+  added on 2026-07-01 and no test exercises it]
+- **It maps content; it does not render Slidev.** CSS, `<v-clicks>` and grid
+  layouts are dropped, `pull` keeps one image per slide, and Mermaid diagrams
+  come back as images, not source. See [Caveats](#caveats).
+- **The tests are not run in CI.** The only workflow publishes to PyPI on a
+  version tag. See [What is verified](#what-is-verified).
+
+What the project's value rests on: the stable object-id scheme plus the hidden
+`<!-- s2g {...} -->` notes marker, which together make push idempotent, let
+`pull` recover the authored source, and give `sync` a per-slide merge base.
+`CHANGELOG.md` (0.10.4, "Id-scheme stability") treats that scheme as a
+compatibility contract with every existing deck.
+
+Confidence tags are an assessment of the evidence in this repo (sample sizes,
+seeds, intervals), added in a 2026-10 README audit; they are not new
+measurements. Here "evidence" means the offline test suite and the changelog
+rather than samples or seeds.
+
+**Contents:** [Why](#why) · [Auth](#auth-no-setup) · [Commands](#commands) ·
+[Idempotent sync](#idempotent-sync-upsert) · [Sync & drift](#sync--drift) ·
+[Markdown dialect](#markdown-dialect) ·
+[Brand kit](#built-in-brand-kit-ibm-plex-red-c0392b-kicker) ·
+[Development](#development) · [What is verified](#what-is-verified) ·
+[Caveats](#caveats) · [History and provenance](#history-and-provenance) ·
+[License](#license)
 
 ## Why
 
@@ -27,14 +87,15 @@ markdown back from those objects, so the loop is reversible.
 
 ## Auth (no setup)
 
-Auth is **borrowed from the [`gog`](https://github.com/) CLI** — no separate
-OAuth client. `slidesync` reads the client id/secret from
-`~/Library/Application Support/gogcli/credentials.json` and the refresh token via
-`gog auth tokens export`, then mints a short-lived access token. The stored token
-already carries the `slides` + `drive` scopes; the Slides API must be enabled on
-the gog Cloud project. Override the account with `--account` or
-`$SLIDESYNC_ACCOUNT`. (Currently macOS-only — it reads gog's macOS Application
-Support path.)
+Auth is **borrowed from the `gog` CLI** — no separate
+OAuth client. `slidesync` reads the client id/secret from gog's credentials file,
+`~/.config/gogcli/credentials.json` (Linux/XDG) or
+`~/Library/Application Support/gogcli/credentials.json` (macOS), and the refresh
+token via `gog auth tokens export`, then mints a short-lived access token. The
+stored token already carries the `slides` + `drive` scopes; the Slides API must
+be enabled on the gog Cloud project. Override the account with `--account` or
+`$SLIDESYNC_ACCOUNT`. (The Linux path was added on 2026-07-01; before that this
+section said macOS-only.)
 
 ## Commands
 
@@ -271,8 +332,30 @@ uv sync
 uv run pytest -q          # offline tests (no network/auth)
 ```
 
-Releases publish to PyPI via Trusted Publishing (OIDC) on a `v*.*.*` tag — see
-`.github/workflows/release.yml`. Bump with `uvx bumpver update --patch`.
+Releases publish to PyPI via Trusted Publishing (OIDC) on a version tag, either
+`v*.*.*` or bumpver's unprefixed `*.*.*` — see `.github/workflows/release.yml`.
+Bump with `uvx bumpver update --patch` (it commits, tags and pushes).
+
+## What is verified
+
+- **Offline test suite:** `uv run pytest -q` ran 181 tests, all passing, in this
+  audit (2026-10-17, Python from `uv sync`). Google APIs are replaced by an
+  in-memory fake that interprets exactly the request types slidesync emits
+  (`tests/test_e2e_scenarios.py`); the Mermaid renderer is monkeypatched, so no
+  test touches the network.
+- **What the fake cannot show:** that the real Slides API accepts every request.
+  The title-less-slide fix at the top of `CHANGELOG.md` is an example: the API
+  rejected a style update on an empty title box and aborted the whole batch;
+  the offline suite missed it until the fix added
+  `tests/test_titleless_slides.py`. Live behaviour is checked by
+  `slidesync roundtrip` (push a sample to a scratch deck, pull it back, assert
+  equality, delete the deck). It needs gog credentials, and this audit did not
+  run it.
+- **No CI runs the tests.** `.github/workflows/release.yml` builds and
+  publishes on a tag without running `pytest` first.
+- **Field use:** `CHANGELOG.md` describes use on real decks, including a live
+  deck with 391 managed slides (0.10.4). That is the main evidence that the
+  tool works beyond the fake; it is anecdotal, not a test.
 
 ## Caveats
 
@@ -285,6 +368,32 @@ Releases publish to PyPI via Trusted Publishing (OIDC) on a `v*.*.*` tag — see
   content hash is now over the authored source). Generative-path slides (no
   `template:`) still merge comments into a single trailing comment on pull,
   since their live Slides edits — not the marker — are the source of truth.
+- Mermaid diagrams render through `mmdc` when it is on `PATH`; otherwise the
+  diagram source is sent to the public kroki.io API. Install mermaid-cli if a
+  deck's diagrams should not leave the machine.
+- Display equations cover matplotlib's mathtext subset only; anything outside it
+  is skipped with a warning, and inline `$x$` maths is not supported.
+- `make-templates` and the built-in brand kit encode one house style. Other
+  styles need code changes (the palette and fonts are constants in
+  `slidesync/_sync.py`).
+- The most important missing piece is automated evidence against the real API:
+  neither the offline suite nor any workflow runs `roundtrip`, so a change in
+  how Google Slides handles a request type would surface only on a real push.
+
+## History and provenance
+
+Written in June–July 2026 (73 commits, 2026-06-10 to 2026-07-22) and released
+to PyPI from 0.1.0 (2026-06-10) to 0.14.0 (2026-07-22), per PyPI's release
+history. At the time of this audit `main` is a version ahead of PyPI and that
+version is not yet tagged. `CHANGELOG.md` covers 0.10.0 onwards and explains
+the reasoning behind each behaviour change, including the incident that
+motivated the re-key guard. The brand palette was taken from one of
+the author's existing decks (comment above `BRAND_FONT` in `slidesync/_sync.py`).
+
+How this README was checked: commands and flags against `slidesync <cmd>
+--help`, the auth paths against `slidesync/_sync.py`, the test claims against a
+local `uv run pytest -q`, and release history against PyPI. The live
+Google Slides path was not exercised.
 
 ## License
 
